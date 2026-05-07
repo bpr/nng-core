@@ -1,11 +1,11 @@
-//! Interoperability tests between nng-pure and the native C `nngcat` tool.
+//! Interoperability tests between nng-core and the native C `nngcat` tool.
 //!
 //! Tests are skipped automatically when `nngcat` is not found in PATH.
 //! Each test uses a unique socket path / port to avoid collisions when the
 //! suite runs in parallel.
 
 use std::time::Duration;
-use nng_pure::{Message, socket::{pipeline0, pubsub0, reqrep0}};
+use nng_core::{Message, socket::{pipeline0, pubsub0, reqrep0}};
 
 fn nngcat_available() -> bool {
     std::process::Command::new("nngcat")
@@ -30,7 +30,7 @@ macro_rules! require_nngcat {
 #[tokio::test]
 async fn req_rust_to_rep_nngcat_ipc() {
     require_nngcat!();
-    let url = "ipc:///tmp/nng_pure_req_rust_rep_c.ipc";
+    let url = "ipc:///tmp/nng_core_req_rust_rep_c.ipc";
 
     // nngcat REP: bind, receive one request, reply with "pong", exit.
     let mut server = std::process::Command::new("nngcat")
@@ -80,7 +80,7 @@ async fn req_rust_to_rep_nngcat_tcp() {
 #[tokio::test]
 async fn req_nngcat_to_rep_rust_ipc() {
     require_nngcat!();
-    let url = "ipc:///tmp/nng_pure_req_c_rep_rust.ipc";
+    let url = "ipc:///tmp/nng_core_req_c_rep_rust.ipc";
 
     let url_owned = url.to_string();
     let listen_task = tokio::spawn(async move {
@@ -147,7 +147,7 @@ async fn req_nngcat_to_rep_rust_tcp() {
 #[tokio::test]
 async fn push_rust_to_pull_nngcat_ipc() {
     require_nngcat!();
-    let url = "ipc:///tmp/nng_pure_push_rust_pull_c.ipc";
+    let url = "ipc:///tmp/nng_core_push_rust_pull_c.ipc";
 
     let mut pull_proc = std::process::Command::new("nngcat")
         .args(["--pull0", "--listen", url])
@@ -170,7 +170,7 @@ async fn push_rust_to_pull_nngcat_ipc() {
 #[tokio::test]
 async fn push_nngcat_to_pull_rust_ipc() {
     require_nngcat!();
-    let url = "ipc:///tmp/nng_pure_push_c_pull_rust.ipc";
+    let url = "ipc:///tmp/nng_core_push_c_pull_rust.ipc";
 
     let url_owned = url.to_string();
     let listen_task = tokio::spawn(async move {
@@ -201,7 +201,7 @@ async fn push_nngcat_to_pull_rust_ipc() {
 #[tokio::test]
 async fn pub_rust_to_sub_nngcat_ipc() {
     require_nngcat!();
-    let url = "ipc:///tmp/nng_pure_pub_rust_sub_c.ipc";
+    let url = "ipc:///tmp/nng_core_pub_rust_sub_c.ipc";
 
     let mut pub0 = pubsub0::Pub0::listen(url).await.unwrap();
 

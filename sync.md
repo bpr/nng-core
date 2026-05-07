@@ -1,8 +1,8 @@
-# Using nng-pure from synchronous code
+# Using nng-core from synchronous code
 
-`nng-pure` is async-only: every socket operation is an `async fn`. The `nng`
+`nng-core` is async-only: every socket operation is an `async fn`. The `nng`
 crate has a blocking synchronous API. This document explains how to call
-`nng-pure` from a `fn main()` or other sync context, covers the API
+`nng-core` from a `fn main()` or other sync context, covers the API
 differences protocol by protocol, and explains the runtime constraints.
 
 ---
@@ -55,14 +55,14 @@ The async helper functions are identical in both options.
 
 ## API mapping
 
-The table below shows the `nng` call on the left and its `nng-pure`
+The table below shows the `nng` call on the left and its `nng-core`
 equivalent on the right. Construction and connection are combined into a
-single constructor in `nng-pure` so there is no separate `dial`/`listen`
+single constructor in `nng-core` so there is no separate `dial`/`listen`
 step.
 
 ### REQ/REP
 
-| `nng` | `nng-pure` |
+| `nng` | `nng-core` |
 |---|---|
 | `Socket::new(Protocol::Req0)?` + `s.dial(url)?` | `Req0::dial(url).await?` |
 | `s.send(bytes)?` + `s.recv()?` | `req.request(msg).await?` |
@@ -76,7 +76,7 @@ runtime check.
 
 ### PUB/SUB
 
-| `nng` | `nng-pure` |
+| `nng` | `nng-core` |
 |---|---|
 | `Socket::new(Protocol::Pub0)?` + `s.listen(url)?` | `Pub0::listen(url).await?` |
 | `s.pipe_notify(move \|_, ev\| { count... })?` | `pub0.wait_for_subscribers(n).await?` or `pub0.subscriber_count()` |
@@ -86,14 +86,14 @@ runtime check.
 | `s.recv()?` | `sub.next().await?` |
 
 `nng`'s `pipe_notify` callback fires whenever a subscriber connects or
-disconnects, making it straightforward to count live subscribers. `nng-pure`
+disconnects, making it straightforward to count live subscribers. `nng-core`
 has no callback mechanism. Use `wait_for_subscribers(n)` to block until `n`
 connections exist, or call `subscriber_count()` after publishing to see how
 many connections are still alive. Failed sends are pruned automatically.
 
 ### PUSH/PULL
 
-| `nng` | `nng-pure` |
+| `nng` | `nng-core` |
 |---|---|
 | `Socket::new(Protocol::Push0)?` + `s.listen/dial(url)?` | `Push0::listen(url).await?` / `Push0::dial(url).await?` |
 | `s.send(bytes)?` | `push.push(msg).await?` |
@@ -102,7 +102,7 @@ many connections are still alive. Failed sends are pruned automatically.
 
 ### PAIR
 
-| `nng` | `nng-pure` |
+| `nng` | `nng-core` |
 |---|---|
 | `Socket::new(Protocol::Pair0)?` + `s.listen/dial(url)?` | `Pair0::listen(url).await?` / `Pair0::dial(url).await?` |
 | `s.send(msg)?` | `pair.send(msg).await?` |
@@ -110,7 +110,7 @@ many connections are still alive. Failed sends are pruned automatically.
 | `s.set_opt::<RecvTimeout>(Some(dur))?` | `tokio::time::timeout(dur, pair.recv()).await` |
 
 `nng` attaches a timeout to the socket with `set_opt` and then every `recv`
-respects it. In `nng-pure` you wrap individual futures with
+respects it. In `nng-core` you wrap individual futures with
 `tokio::time::timeout`:
 
 ```rust
@@ -122,7 +122,7 @@ match s.recv() {
     Err(e)            => return Err(e),
 }
 
-// nng-pure
+// nng-core
 match tokio::time::timeout(Duration::from_millis(100), pair.recv()).await {
     Ok(Ok(msg))   => { /* got message */ }
     Err(_elapsed) => { /* timed out */ }
@@ -132,7 +132,7 @@ match tokio::time::timeout(Duration::from_millis(100), pair.recv()).await {
 
 ### SURVEYOR/RESPONDENT
 
-| `nng` | `nng-pure` |
+| `nng` | `nng-core` |
 |---|---|
 | `Socket::new(Protocol::Surveyor0)?` + `s.listen(url)?` | `Surveyor0::listen(url).await?` |
 | _(wait for respondents with `thread::sleep`)_ | `surveyor.wait_for_respondents(n).await?` |
@@ -142,7 +142,7 @@ match tokio::time::timeout(Duration::from_millis(100), pair.recv()).await {
 | `s.send(reply)?` | `handle.respond(reply).await?` |
 
 `nng`'s surveyor calls `send` once then loops on `recv` until it gets
-`Error::TimedOut`, handling the timeout window manually. `nng-pure` wraps
+`Error::TimedOut`, handling the timeout window manually. `nng-core` wraps
 this entirely in `survey(msg, timeout)` which fans out the question, collects
 all responses that arrive before the deadline, and returns them as a
 `Vec<Message>`. The `SurveyHandle` from `receive()` plays the same role as
@@ -150,7 +150,7 @@ all responses that arrive before the deadline, and returns them as a
 
 ### BUS
 
-| `nng` | `nng-pure` |
+| `nng` | `nng-core` |
 |---|---|
 | `Socket::new(Protocol::Bus0)?` + `s.listen(url)?` | `Bus0::listen_and_accept(url, n).await?` |
 | `s.dial(peer)?` _(multiple calls)_ | `Bus0::dial(url).await?` _(single peer per call)_ |
@@ -158,7 +158,7 @@ all responses that arrive before the deadline, and returns them as a
 | `s.recv()?` | `bus.recv_any().await?` / `bus.recv_from(peer_idx).await?` |
 
 `nng`'s bus socket can both listen and dial multiple peers from the same
-handle, building a mesh. `nng-pure` currently supports either listening
+handle, building a mesh. `nng-core` currently supports either listening
 (accepting `n` inbound connections via `listen_and_accept`) or dialing (one
 outbound connection per `Bus0::dial`). To connect a node to two peers you
 would call `dial` twice and merge the two `Bus0` instances, or construct the
@@ -211,10 +211,10 @@ fn reply(url: &str) -> Result<(), Error> {
 }
 ```
 
-**After (`nng-pure`, async with `#[tokio::main]`):**
+**After (`nng-core`, async with `#[tokio::main]`):**
 
 ```rust
-use nng_pure::{Message, socket::reqrep0};
+use nng_core::{Message, socket::reqrep0};
 
 #[tokio::main]
 async fn main() {
@@ -251,7 +251,7 @@ async fn reply(url: &str) -> std::io::Result<()> {
 }
 ```
 
-**After (`nng-pure`, async with `Runtime::block_on`):**
+**After (`nng-core`, async with `Runtime::block_on`):**
 
 ```rust
 fn main() {
@@ -282,7 +282,7 @@ thread::spawn(move || { s2.recv().unwrap(); });
 s.send(b"hello")?;
 ```
 
-`nng-pure` sockets take `&mut self`, so they cannot be shared across tasks
+`nng-core` sockets take `&mut self`, so they cannot be shared across tasks
 without a wrapper. The idiomatic async approach is to give each task its own
 socket end and communicate through the protocol itself rather than sharing a
 handle. When sharing is genuinely necessary, wrap the socket in
@@ -305,7 +305,7 @@ pair.lock().await.send(msg).await?;
 
 `block_on` itself is not runtime-specific — it simply drives a future to
 completion on the current thread. However, **the futures produced by
-`nng-pure`'s socket layer depend on tokio** and will not work when driven by
+`nng-core`'s socket layer depend on tokio** and will not work when driven by
 a different runtime's executor.
 
 The socket layer uses:

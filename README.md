@@ -1,4 +1,4 @@
-# nng-pure
+# nng-core
 
 A pure-Rust, `no_std`-compatible implementation of the [NNG Scalability Protocols](https://nng.nanomsg.org/).
 
@@ -6,14 +6,14 @@ A pure-Rust, `no_std`-compatible implementation of the [NNG Scalability Protocol
 
 `nng-sys`, `nng`, and `anng` all depend on `libnng`, a C library built via CMake. This blocks use in WebAssembly, bare-metal embedded targets, and environments without a C toolchain.
 
-`nng-pure` replaces the C core with a clean-room Rust implementation:
+`nng-core` replaces the C core with a clean-room Rust implementation:
 
 - **No C dependency.** No `cmake`, no `cc`, no `bindgen`. Pure Rust all the way down.
 - **`no_std` + `alloc` core.** The wire codec and protocol state machines compile without the standard library. Only the TCP socket layer (behind the `std` feature) requires tokio.
 - **Runtime-agnostic transport.** The framing layer is generic over `embedded-io-async`'s `Read + Write` traits, so the same protocol code runs on tokio (Linux/macOS/Windows) and Embassy (bare metal).
-- **Interoperable wire format.** The SP (Scalability Protocol) handshake and message framing are byte-for-byte compatible with `libnng`, so `nng-pure` peers talk to native NNG nodes over TCP.
+- **Interoperable wire format.** The SP (Scalability Protocol) handshake and message framing are byte-for-byte compatible with `libnng`, so `nng-core` peers talk to native NNG nodes over TCP.
 
-The long-term goal is for `nng` and `anng` to use `nng-pure` instead of `nng-sys`, removing the C dependency from the whole workspace.
+The long-term goal is for `nng` and `anng` to use `nng-core` instead of `nng-sys`, removing the C dependency from the whole workspace.
 
 ## Protocols
 
@@ -32,15 +32,15 @@ All six NNG protocol families are implemented:
 
 ```toml
 [dependencies]
-nng-pure = { path = "../nng-pure" }          # std + tokio (default)
-# nng-pure = { path = "../nng-pure", default-features = false }  # no_std core only
+nng-core = { path = "../nng-core" }          # std + tokio (default)
+# nng-core = { path = "../nng-core", default-features = false }  # no_std core only
 ```
 
 ### REQ/REP
 
 ```rust
 use std::fmt::Write;
-use nng_pure::{Message, socket::reqrep0};
+use nng_core::{Message, socket::reqrep0};
 
 // Server
 let mut rep = reqrep0::Rep0::listen("tcp://127.0.0.1:5555").await?;
@@ -60,7 +60,7 @@ println!("{}", String::from_utf8_lossy(reply.body())); // "Hello, world!"
 ### PUB/SUB
 
 ```rust
-use nng_pure::{Message, socket::pubsub0};
+use nng_core::{Message, socket::pubsub0};
 
 // Publisher
 let mut pub0 = pubsub0::Pub0::listen("tcp://127.0.0.1:5556").await?;
@@ -101,7 +101,7 @@ The key design decisions:
 
 ## Wire compatibility
 
-The SP wire protocol is documented in the NNG source. `nng-pure` uses the same:
+The SP wire protocol is documented in the NNG source. `nng-core` uses the same:
 
 - 8-byte handshake: `\x00SP\x00` + own protocol ID (u16 BE) + `\x00\x00`
 - Per-message framing: u64 BE payload length + (header bytes)(body bytes)
@@ -112,17 +112,17 @@ To verify interoperability, run the `req-rep` example against a native `libnng` 
 ## Running the examples
 
 ```bash
-cargo run -p nng-pure --example req-rep
-cargo run -p nng-pure --example pubsub
-cargo run -p nng-pure --example pipeline
-cargo run -p nng-pure --example pair
-cargo run -p nng-pure --example survey
-cargo run -p nng-pure --example bus
+cargo run -p nng-core --example req-rep
+cargo run -p nng-core --example pubsub
+cargo run -p nng-core --example pipeline
+cargo run -p nng-core --example pair
+cargo run -p nng-core --example survey
+cargo run -p nng-core --example bus
 ```
 
 ## Running the tests
 
 ```bash
-cargo test -p nng-pure          # all 75 tests
-cargo build -p nng-pure --no-default-features   # verify no_std core
+cargo test -p nng-core          # all 75 tests
+cargo build -p nng-core --no-default-features   # verify no_std core
 ```

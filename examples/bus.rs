@@ -3,11 +3,11 @@
 //! A hub node accepts two spoke nodes; it broadcasts a message to both and
 //! then each spoke broadcasts a reply back.
 //!
-//! Run with:  cargo run -p nng-pure --example bus
+//! Run with:  cargo run -p nng-core --example bus
 
 use std::fmt::Write;
 
-use nng_pure::{Message, socket::bus0};
+use nng_core::{Message, socket::bus0};
 
 const ADDR: &str = "tcp://127.0.0.1:54326";
 

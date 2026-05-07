@@ -3,12 +3,12 @@
 //! Surveyor broadcasts a "status?" query; two respondents reply with their
 //! identities.  The surveyor prints all responses.
 //!
-//! Run with:  cargo run -p nng-pure --example survey
+//! Run with:  cargo run -p nng-core --example survey
 
 use std::fmt::Write;
 use std::time::Duration;
 
-use nng_pure::{Message, socket::survey0};
+use nng_core::{Message, socket::survey0};
 
 const ADDR: &str = "tcp://127.0.0.1:54325";
 

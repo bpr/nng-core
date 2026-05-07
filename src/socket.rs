@@ -1,4 +1,4 @@
-//! High-level socket API for nng-pure (requires `std` / tokio).
+//! High-level socket API for nng-core (requires `std` / tokio).
 //!
 //! Supported URL schemes: `tcp://host:port` and (Unix only) `ipc:///path`.
 //!

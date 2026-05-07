@@ -3,11 +3,11 @@
 //! A publisher broadcasts messages with different topic prefixes.
 //! Two subscribers each filter to a single topic and print what they receive.
 //!
-//! Run with:  cargo run -p nng-pure --example pubsub
+//! Run with:  cargo run -p nng-core --example pubsub
 
 use std::fmt::Write;
 
-use nng_pure::{Message, socket::pubsub0};
+use nng_core::{Message, socket::pubsub0};
 
 const ADDR: &str = "tcp://127.0.0.1:54322";
 

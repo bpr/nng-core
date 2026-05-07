@@ -1,4 +1,4 @@
-use nng_pure::{
+use nng_core::{
     MessageBuf, ZeroCopyMessage,
     protocols::{
         pair::{Pair1State, PairError},

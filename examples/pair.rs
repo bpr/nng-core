@@ -2,11 +2,11 @@
 //!
 //! Two tasks exchange messages in both directions simultaneously.
 //!
-//! Run with:  cargo run -p nng-pure --example pair
+//! Run with:  cargo run -p nng-core --example pair
 
 use std::fmt::Write;
 
-use nng_pure::{Message, socket::pair0};
+use nng_core::{Message, socket::pair0};
 
 const ADDR: &str = "tcp://127.0.0.1:54324";
 

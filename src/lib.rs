@@ -1,6 +1,6 @@
 //! Pure-Rust implementation of the SP (Scalability Protocol) wire format.
 //!
-//! `nng-pure` provides the message types, protocol state machines, and
+//! `nng-core` provides the message types, protocol state machines, and
 //! transport layer needed to speak NNG's SP protocol from Rust without
 //! linking to the NNG C library. It targets `no_std + alloc` for the core
 //! types (protocol state machines, codec, [`ZeroCopyMessage`]) and gates
@@ -36,7 +36,7 @@
 //! The `std` feature is enabled by default. To build without it:
 //!
 //! ```toml
-//! nng-pure = { default-features = false }
+//! nng-core = { default-features = false }
 //! ```
 //!
 //! With `no_std` the transport, socket, and TCP/IPC modules are unavailable,

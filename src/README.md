@@ -1,4 +1,4 @@
-# nng-pure source overview
+# nng-core source overview
 
 The source is organized in four layers, each depending only on the layers below it. The bottom two layers compile under `#![no_std]`; the top two require the `std` feature (tokio).
 

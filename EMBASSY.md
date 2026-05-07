@@ -1,15 +1,15 @@
-# Using nng-pure with Embassy
+# Using nng-core with Embassy
 
-Embassy is the natural fit for `nng-pure` on bare-metal targets. Both crates
+Embassy is the natural fit for `nng-core` on bare-metal targets. Both crates
 build on `embedded-io-async`: Embassy's TCP stack already implements the same
 `Read + Write` traits that `FramedTransport<T>` is parameterized over, so the
-core of `nng-pure` requires no adaptation at all.
+core of `nng-core` requires no adaptation at all.
 
 ---
 
 ## What works without modification
 
-The bottom three layers of `nng-pure` compile in `no_std` + `alloc` mode and
+The bottom three layers of `nng-core` compile in `no_std` + `alloc` mode and
 have no runtime dependency:
 
 | Layer | Files | Status |
@@ -25,7 +25,7 @@ adapter layer. This is not a coincidence — `embedded-io-async` was chosen
 precisely because it is the shared I/O abstraction between Embassy and other
 embedded runtimes.
 
-The `socket.rs` that ships with `nng-pure` is tokio-specific and is not used
+The `socket.rs` that ships with `nng-core` is tokio-specific and is not used
 in an Embassy build. You work with `FramedTransport` and the state machines
 directly, or write a thin Embassy socket layer (see
 [Writing a socket layer](#writing-an-embassy-socket-layer)).
@@ -40,7 +40,7 @@ Disable the `std` feature so the tokio-dependent code is excluded:
 
 ```toml
 [dependencies]
-nng-pure = { path = "…/nng-pure", default-features = false }
+nng-core = { path = "…/nng-core", default-features = false }
 
 embassy-executor  = { version = "0.6", features = ["arch-cortex-m", "executor-thread"] }
 embassy-net       = { version = "0.4", features = ["tcp", "dhcpv4"] }
@@ -48,13 +48,13 @@ embassy-time      = { version = "0.3" }
 embassy-futures   = { version = "0.1" }
 embedded-io-async = { version = "0.7" }
 
-# nng-pure's Message type uses Vec<u8> and needs a heap allocator
+# nng-core's Message type uses Vec<u8> and needs a heap allocator
 embedded-alloc    = { version = "0.6" }
 ```
 
 ### Heap allocator
 
-`embassy-net` itself is heapless, but `nng-pure`'s `Message` type uses
+`embassy-net` itself is heapless, but `nng-core`'s `Message` type uses
 `Vec<u8>` internally. A global allocator must be initialized before any
 `Message` is constructed:
 
@@ -69,7 +69,7 @@ static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // Must happen before any nng-pure code runs.
+    // Must happen before any nng-core code runs.
     unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
 
     // … initialize peripherals, network stack, spawn tasks …
@@ -89,7 +89,7 @@ allocations are intentional.
 
 ```rust
 use embassy_net::{Stack, tcp::TcpSocket};
-use nng_pure::{
+use nng_core::{
     Message,
     codec::ProtocolId,
     protocols::reqrep::Req0State,
@@ -132,7 +132,7 @@ async fn req_task(stack: &'static Stack<impl Driver + 'static>) {
 
 ```rust
 use embassy_net::tcp::{IpListenEndpoint, TcpSocket};
-use nng_pure::{
+use nng_core::{
     Message,
     codec::ProtocolId,
     protocols::reqrep::Rep0State,
@@ -179,7 +179,7 @@ filters messages. Use `Sub0State::matches` to decide whether to pass each
 received message to the application:
 
 ```rust
-use nng_pure::{
+use nng_core::{
     Message,
     codec::ProtocolId,
     protocols::pubsub::Sub0State,

@@ -1,4 +1,4 @@
-use nng_pure::{
+use nng_core::{
     Message,
     codec::{
         CodecError, ProtocolId, check_peer, decode_frame, decode_handshake, encode_frame,

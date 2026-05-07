@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use nng_pure::{Message, socket::reqrep0};
+use nng_core::{Message, socket::reqrep0};
 
 /// Pick a free port for the test server.  We bind 0 and extract the port.
 async fn free_addr() -> String {

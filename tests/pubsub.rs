@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use nng_pure::{Message, socket::pubsub0};
+use nng_core::{Message, socket::pubsub0};
 
 async fn free_addr() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

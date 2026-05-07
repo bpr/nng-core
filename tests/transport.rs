@@ -1,4 +1,4 @@
-use nng_pure::{
+use nng_core::{
     Message,
     codec::ProtocolId,
     transport::{FrameFormat, loopback::inproc_pair},
@@ -59,7 +59,7 @@ async fn loopback_empty_message() {
 #[tokio::test]
 async fn loopback_protocol_mismatch_is_error() {
     // Connecting REQ to PUB should fail with IncompatibleProtocol.
-    use nng_pure::transport::{FramedTransport, loopback::TokioDuplex};
+    use nng_core::transport::{FramedTransport, loopback::TokioDuplex};
 
     let (a, b) = tokio::io::duplex(64 * 1024);
     let result = tokio::try_join!(
@@ -72,7 +72,7 @@ async fn loopback_protocol_mismatch_is_error() {
 #[tokio::test]
 async fn loopback_large_message() {
     // Use a large duplex buffer so the 100KB message doesn't deadlock.
-    use nng_pure::transport::{FramedTransport, loopback::TokioDuplex};
+    use nng_core::transport::{FramedTransport, loopback::TokioDuplex};
     let (a_stream, b_stream) = tokio::io::duplex(256 * 1024);
     let (mut a, mut b) = tokio::try_join!(
         FramedTransport::connect(TokioDuplex(a_stream), ProtocolId::PAIR0, FrameFormat::Tcp),

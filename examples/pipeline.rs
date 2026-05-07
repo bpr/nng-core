@@ -2,11 +2,11 @@
 //!
 //! A pusher distributes 8 tasks to a puller, which processes each one.
 //!
-//! Run with:  cargo run -p nng-pure --example pipeline
+//! Run with:  cargo run -p nng-core --example pipeline
 
 use std::fmt::Write;
 
-use nng_pure::{Message, socket::pipeline0};
+use nng_core::{Message, socket::pipeline0};
 
 const ADDR: &str = "tcp://127.0.0.1:54323";
 

@@ -1,5 +1,5 @@
-use nng_pure::Message;
-use nng_pure::protocols::{
+use nng_core::Message;
+use nng_core::protocols::{
     pair::{Pair1State, PairError},
     pubsub::{Pub0State, Sub0State},
     reqrep::{Rep0State, Req0State, ReqRepError},

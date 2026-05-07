@@ -1,4 +1,4 @@
-use nng_pure::Message;
+use nng_core::Message;
 
 #[test]
 fn new_is_empty() {
