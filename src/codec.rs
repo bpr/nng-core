@@ -1,44 +1,69 @@
 //! SP (Scalability Protocol) wire codec: handshake and message framing.
 //!
-//! ## Handshake (8 bytes, sent by both sides immediately on connect)
-//! ```text
-//! [0x00] ['S'] ['P'] [0x00] [proto_hi] [proto_lo] [0x00] [0x00]
-//! ```
-//! `proto` is the sender's own protocol ID as a big-endian `u16`.
+//! # Handshake
 //!
-//! ## Message frame (per-message, after handshake)
+//! Both sides send an 8-byte header immediately on connect, before any messages:
+//!
 //! ```text
-//! [8-byte u64 BE length = header_len + body_len] [header bytes] [body bytes]
+//! byte:  0     1     2     3     4       5       6     7
+//!       0x00  'S'   'P'  0x00  proto_hi proto_lo  0x00  0x00
+//!                          └───── protocol ID, u16 big-endian ─────┘
 //! ```
-//! The receiver allocates `length` bytes and places them all into the body.
-//! The protocol state machine is then responsible for extracting its header
-//! portion from the front of the body.
+//!
+//! `proto` is the *sender's own* protocol ID. Each side independently checks
+//! that the remote's ID is the expected peer (e.g., REQ0 accepts only REP0).
+//! This is a symmetric handshake: both sides validate, both sides may reject.
+//!
+//! # Message framing
+//!
+//! After the handshake, each message is framed as:
+//!
+//! ```text
+//! [8-byte u64 BE length][payload bytes …]
+//! ```
+//!
+//! where `length = header_len + body_len`. On receive, the entire payload lands
+//! in the message **body**. The protocol state machine is then responsible for
+//! stripping its own header fields off the front of the body. This design means
+//! the transport layer needs no knowledge of protocol-specific header formats.
 
 use crate::Message;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-// ── Protocol IDs (confirmed against NNG C source, NNI_PROTO(major, minor) = major*16+minor) ──
+// ── Protocol IDs ──────────────────────────────────────────────────────────────
+//
+// Values are computed by NNG's NNI_PROTO(major, minor) macro:
+//   NNI_PROTO(m, n) = (m << 4) | n    (i.e., major * 16 + minor)
+//
+// Confirmed against nng/include/nng/nng.h in the NNG source.
 
-/// SP protocol identifier (the value sent in bytes 4..5 of the handshake).
+/// SP protocol identifier, sent in bytes 4–5 of the handshake.
+///
+/// The numeric value encodes the protocol family (high nibble) and version
+/// (low nibble) using NNG's `NNI_PROTO(major, minor)` convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolId(pub u16);
 
 impl ProtocolId {
     pub const PAIR0: Self = Self(0x10); // NNI_PROTO(1,0)
     pub const PAIR1: Self = Self(0x11); // NNI_PROTO(1,1)
-    pub const PUB0: Self = Self(0x20); // NNI_PROTO(2,0)
-    pub const SUB0: Self = Self(0x21); // NNI_PROTO(2,1)
-    pub const REQ0: Self = Self(0x30); // NNI_PROTO(3,0)
-    pub const REP0: Self = Self(0x31); // NNI_PROTO(3,1)
+    pub const PUB0: Self = Self(0x20);  // NNI_PROTO(2,0)
+    pub const SUB0: Self = Self(0x21);  // NNI_PROTO(2,1)
+    pub const REQ0: Self = Self(0x30);  // NNI_PROTO(3,0)
+    pub const REP0: Self = Self(0x31);  // NNI_PROTO(3,1)
     pub const PUSH0: Self = Self(0x50); // NNI_PROTO(5,0)
     pub const PULL0: Self = Self(0x51); // NNI_PROTO(5,1)
-    pub const SURVEYOR0: Self = Self(0x62); // NNI_PROTO(6,2)
+    pub const SURVEYOR0: Self = Self(0x62);   // NNI_PROTO(6,2)
     pub const RESPONDENT0: Self = Self(0x63); // NNI_PROTO(6,3)
-    pub const BUS0: Self = Self(0x70); // NNI_PROTO(7,0)
+    pub const BUS0: Self = Self(0x70);  // NNI_PROTO(7,0)
 
-    /// Return the protocol ID expected from the remote peer.
+    /// Return the protocol ID that the remote peer must present.
+    ///
+    /// Asymmetric pairs (REQ↔REP, PUB↔SUB, PUSH↔PULL, SURVEYOR↔RESPONDENT)
+    /// require opposite IDs. Symmetric protocols (PAIR0, PAIR1, BUS0) accept
+    /// the same ID on both sides.
     pub fn expected_peer(self) -> Self {
         match self {
             Self::REQ0 => Self::REP0,
@@ -52,22 +77,28 @@ impl ProtocolId {
             Self::SURVEYOR0 => Self::RESPONDENT0,
             Self::RESPONDENT0 => Self::SURVEYOR0,
             Self::BUS0 => Self::BUS0,
-            _ => self, // unknown — no peer check
+            _ => self, // unknown protocol — skip peer check
         }
     }
 }
 
-// ── Handshake ──
+// ── Handshake ─────────────────────────────────────────────────────────────────
 
 const MAGIC: [u8; 4] = [0x00, b'S', b'P', 0x00];
 
-/// Encode the 8-byte SP handshake for a given local protocol.
+/// Encode the 8-byte SP handshake header for `local`.
+///
+/// The caller should write the returned bytes to the wire immediately on
+/// connect, before sending any messages.
 pub fn encode_handshake(local: ProtocolId) -> [u8; 8] {
     let [hi, lo] = local.0.to_be_bytes();
     [MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], hi, lo, 0, 0]
 }
 
 /// Validate an 8-byte SP handshake buffer and return the remote's protocol ID.
+///
+/// Returns `Err` if the magic bytes are wrong or the reserved bytes are
+/// non-zero. Use [`check_peer`] afterwards to verify protocol compatibility.
 pub fn decode_handshake(buf: &[u8; 8]) -> Result<ProtocolId, CodecError> {
     if buf[0] != MAGIC[0] || buf[1] != MAGIC[1] || buf[2] != MAGIC[2] || buf[3] != MAGIC[3] {
         return Err(CodecError::InvalidMagic);
@@ -79,7 +110,11 @@ pub fn decode_handshake(buf: &[u8; 8]) -> Result<ProtocolId, CodecError> {
     Ok(remote)
 }
 
-/// Verify that the remote's protocol ID is the expected peer for `local`.
+/// Verify that `remote` is the expected peer for `local`.
+///
+/// Called after [`decode_handshake`] to enforce protocol compatibility. For
+/// example, a REQ0 socket must connect to a REP0 socket; any other remote
+/// protocol ID yields [`CodecError::IncompatibleProtocol`].
 pub fn check_peer(local: ProtocolId, remote: ProtocolId) -> Result<(), CodecError> {
     let expected = local.expected_peer();
     if remote != expected {
@@ -89,10 +124,13 @@ pub fn check_peer(local: ProtocolId, remote: ProtocolId) -> Result<(), CodecErro
     }
 }
 
-// ── Frame encode ──
+// ── Frame encode ──────────────────────────────────────────────────────────────
 
-/// Encode a message as an SP frame into a `Vec<u8>`.
-/// Wire layout: [8-byte u64 BE length][header bytes][body bytes].
+/// Encode a message as a complete SP frame into a `Vec<u8>`.
+///
+/// Wire layout: `[8-byte u64 BE length][header bytes][body bytes]`.
+/// The length field covers both header and body — the receiver allocates that
+/// many bytes without knowing the internal split.
 pub fn encode_frame(msg: &Message) -> Vec<u8> {
     let header = msg.header();
     let body = msg.body();
@@ -105,15 +143,16 @@ pub fn encode_frame(msg: &Message) -> Vec<u8> {
     out
 }
 
-// ── Frame decode ──
+// ── Frame decode ──────────────────────────────────────────────────────────────
 
 /// Attempt to decode a single SP frame from `src`.
 ///
-/// Returns `Ok((Message, bytes_consumed))` on success, where the entire
-/// wire payload (header + body bytes) is placed into the message **body**
-/// (the protocol state machine is responsible for splitting out its header).
+/// Returns `Ok((msg, bytes_consumed))` on success. The entire wire payload
+/// (header + body combined) is placed into `msg.body()` — the protocol state
+/// machine will strip its own header fields from the front later.
 ///
-/// Returns `Err(CodecError::Incomplete)` if more data is needed.
+/// Returns `Err(`[`CodecError::Incomplete`]`)` if `src` does not yet contain a
+/// full frame (the caller should buffer and retry).
 pub fn decode_frame(src: &[u8]) -> Result<(Message, usize), CodecError> {
     if src.len() < 8 {
         return Err(CodecError::Incomplete);
@@ -127,20 +166,21 @@ pub fn decode_frame(src: &[u8]) -> Result<(Message, usize), CodecError> {
     Ok((msg, 8 + len))
 }
 
-// ── Errors ──
+// ── Errors ────────────────────────────────────────────────────────────────────
 
+/// Errors that can occur during SP handshake or frame decoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodecError {
-    /// The first four magic bytes were not `\0SP\0`.
+    /// The first four bytes were not `\0SP\0`.
     InvalidMagic,
-    /// Reserved bytes (6 and 7 of handshake) were non-zero.
+    /// Handshake bytes 6–7 (reserved) were non-zero.
     ReservedNotZero,
-    /// Remote's protocol ID does not match what we expect.
+    /// Remote's protocol ID does not match the expected peer for our protocol.
     IncompatibleProtocol {
         local: ProtocolId,
         remote: ProtocolId,
     },
-    /// Not enough bytes to complete decoding.
+    /// Not enough bytes to complete decoding; caller should buffer and retry.
     Incomplete,
 }
 

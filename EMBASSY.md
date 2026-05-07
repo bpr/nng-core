@@ -2,7 +2,7 @@
 
 Embassy is the natural fit for `nng-pure` on bare-metal targets. Both crates
 build on `embedded-io-async`: Embassy's TCP stack already implements the same
-`Read + Write` traits that `FramedTransport<T>` is parameterised over, so the
+`Read + Write` traits that `FramedTransport<T>` is parameterized over, so the
 core of `nng-pure` requires no adaptation at all.
 
 ---
@@ -55,7 +55,7 @@ embedded-alloc    = { version = "0.6" }
 ### Heap allocator
 
 `embassy-net` itself is heapless, but `nng-pure`'s `Message` type uses
-`Vec<u8>` internally. A global allocator must be initialised before any
+`Vec<u8>` internally. A global allocator must be initialized before any
 `Message` is constructed:
 
 ```rust
@@ -72,7 +72,7 @@ async fn main(spawner: Spawner) {
     // Must happen before any nng-pure code runs.
     unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
 
-    // … initialise peripherals, network stack, spawn tasks …
+    // … initialize peripherals, network stack, spawn tasks …
 }
 ```
 

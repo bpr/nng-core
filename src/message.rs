@@ -1,13 +1,78 @@
-//! NNG message with separate header and body buffers.
+//! NNG message types and the [`MessageBuf`] trait.
 //!
-//! The header carries SP protocol metadata (request IDs, routing info, TTL, survey IDs).
-//! The body carries application payload. Both are manipulated via prepend/append/trim operations
-//! that avoid copying when possible.
+//! # Two-part message structure
+//!
+//! Every NNG message has two logical regions:
+//!
+//! - **Header** — SP protocol metadata prepended by the protocol state machine:
+//!   request IDs (REQ/REP), TTL hop counts (PAIR1), survey IDs (SURVEYOR), etc.
+//!   On send the header is transmitted *before* the body. On receive all wire
+//!   bytes land in the body; the state machine then strips its header off the
+//!   front.
+//! - **Body** — application payload, opaque to the transport layer.
+//!
+//! # Implementations
+//!
+//! | Type | Storage | `trim_front` | Requires |
+//! |---|---|---|---|
+//! | [`Message`] | `Vec<u8>` on the heap | O(n) — shifts bytes | `alloc` |
+//! | [`ZeroCopyMessage<N>`] | `[u8; N]` on the stack | **O(1)** — advances a pointer | nothing |
+//!
+//! Both implement [`MessageBuf`], so all protocol state machines are generic
+//! over either type.
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-/// A two-part NNG message: protocol `header` + application `body`.
+// ── MessageBuf trait ──────────────────────────────────────────────────────────
+
+/// Minimal interface over an NNG message buffer.
+///
+/// All SP protocol state machines are generic over `M: MessageBuf`, which lets
+/// them operate on both heap-backed [`Message`] values and stack-allocated
+/// [`ZeroCopyMessage`] values without any change to logic.
+///
+/// Only the five operations actually required by the state machines are
+/// included. This keeps `no_alloc` implementations simple: there is no need
+/// for `push_front`, `trim_back`, or any operation that implies reallocation.
+///
+/// # Implementing `MessageBuf`
+///
+/// The invariant callers rely on:
+/// - After `trim_front(n)`, `body()` returns `n` fewer bytes from the front.
+/// - After `header_push_back(data)`, `header()` returns `data` at its back.
+/// - `body()` and `header()` return non-overlapping slices.
+pub trait MessageBuf {
+    /// The application payload.
+    fn body(&self) -> &[u8];
+
+    /// The protocol header (request IDs, routing info, TTL, …).
+    fn header(&self) -> &[u8];
+
+    /// Append `data` to the back of the body.
+    fn push_back(&mut self, data: &[u8]);
+
+    /// Append `data` to the back of the header.
+    fn header_push_back(&mut self, data: &[u8]);
+
+    /// Discard the first `n` bytes of the body.
+    ///
+    /// Used by protocol state machines to strip their header fields after
+    /// reading them off the front of an incoming message body. In
+    /// [`ZeroCopyMessage`] this is O(1); in [`Message`] it shifts bytes.
+    fn trim_front(&mut self, n: usize);
+}
+
+// ── Message (heap-backed) ─────────────────────────────────────────────────────
+
+/// A heap-allocated two-part NNG message: protocol `header` + application `body`.
+///
+/// Each part is stored in an independent `Vec<u8>`, so appending to either
+/// region is amortized O(1). The downside is that [`trim_front`](Self::trim_front)
+/// calls `Vec::drain` which is O(n) — it shifts the remaining bytes left.
+/// Use [`ZeroCopyMessage`] when that matters.
+///
+/// Requires the `alloc` feature (enabled by default via `std`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Message {
     header: Vec<u8>,
@@ -117,6 +182,24 @@ impl Message {
     }
 }
 
+impl MessageBuf for Message {
+    fn body(&self) -> &[u8] {
+        self.body()
+    }
+    fn header(&self) -> &[u8] {
+        self.header()
+    }
+    fn push_back(&mut self, data: &[u8]) {
+        self.push_back(data);
+    }
+    fn header_push_back(&mut self, data: &[u8]) {
+        self.header_push_back(data);
+    }
+    fn trim_front(&mut self, n: usize) {
+        self.trim_front(n);
+    }
+}
+
 /// Appending to a `Message` writes to its body.
 impl core::fmt::Write for Message {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -139,4 +222,124 @@ impl embedded_io_async::Write for Message {
 
 impl embedded_io_async::ErrorType for Message {
     type Error = core::convert::Infallible;
+}
+
+// ── ZeroCopyMessage ───────────────────────────────────────────────────────────
+
+/// A stack-allocated NNG message for `no_alloc` environments.
+///
+/// # Buffer layout
+///
+/// The `N`-byte backing array is split into a header region (the first `N/4`
+/// bytes) and a body region (the remaining `3N/4` bytes):
+///
+/// ```text
+///  index:  0       h_end   N/4        b_start       b_end        N
+///          ├────────┼────────┼───────────┼─────────────┼───────────┤
+///          │ header │ h-free │  trimmed  │    body     │  tailroom │
+///          └────────┴────────┴───────────┴─────────────┴───────────┘
+///                                         ↑ advances right on trim_front
+/// ```
+///
+/// - `header()` returns `buf[0..h_end]`.
+/// - `body()` returns `buf[b_start..b_end]`.
+/// - `b_start` begins at `N/4` (right after the header region) and only ever
+///   moves rightward. This is the key to **O(1) `trim_front`**: instead of
+///   shifting bytes like `Vec::drain`, we just increment a pointer.
+///
+/// The "trimmed" zone between `N/4` and `b_start` is dead space — bytes that
+/// have been consumed but not zeroed. This is the same trick used by Linux's
+/// `sk_buff` network buffer for O(1) header stripping in the network stack.
+///
+/// # Choosing `N`
+///
+/// - Header capacity: `N / 4` bytes. SP protocol headers are at most 4 bytes
+///   (one `u32`), so `N = 16` is enough for protocols; use more if you need
+///   multi-layer routing headroom.
+/// - Body capacity: `3N / 4` bytes, minus any bytes consumed by `trim_front`.
+///
+/// # Panics
+///
+/// Panics on capacity overflow or out-of-bounds `trim_front`. Size your buffer
+/// at compile time — that is the entire point of this type.
+pub struct ZeroCopyMessage<const N: usize> {
+    buf: [u8; N],
+    /// End of the used header region: `header() == buf[0..h_end]`.
+    h_end: usize,
+    /// Current start of the body, advances right on `trim_front`.
+    b_start: usize,
+    /// Current end of the body, advances right on `push_back`.
+    b_end: usize,
+}
+
+impl<const N: usize> ZeroCopyMessage<N> {
+    /// Bytes reserved at the front of the buffer for the header region.
+    const HEADER_CAP: usize = N / 4;
+
+    /// Construct a new, empty message.
+    ///
+    /// Both the header and body are empty; `b_start` is positioned right after
+    /// the header region so the body can grow into `3N/4` bytes of tailroom.
+    pub fn new() -> Self {
+        Self {
+            buf: [0; N],
+            h_end: 0,
+            b_start: Self::HEADER_CAP,
+            b_end: Self::HEADER_CAP,
+        }
+    }
+
+    /// Maximum number of header bytes this message can hold.
+    pub const fn header_capacity() -> usize {
+        Self::HEADER_CAP
+    }
+
+    /// Maximum number of body bytes this message can hold (initial, before any `trim_front`).
+    pub const fn body_capacity() -> usize {
+        N - Self::HEADER_CAP
+    }
+
+    /// Remaining body capacity: bytes available for further `push_back` calls.
+    pub fn body_remaining(&self) -> usize {
+        N - self.b_end
+    }
+}
+
+impl<const N: usize> Default for ZeroCopyMessage<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> MessageBuf for ZeroCopyMessage<N> {
+    fn body(&self) -> &[u8] {
+        &self.buf[self.b_start..self.b_end]
+    }
+
+    fn header(&self) -> &[u8] {
+        &self.buf[..self.h_end]
+    }
+
+    fn push_back(&mut self, data: &[u8]) {
+        let new_end = self.b_end + data.len();
+        assert!(new_end <= N, "ZeroCopyMessage body overflow");
+        self.buf[self.b_end..new_end].copy_from_slice(data);
+        self.b_end = new_end;
+    }
+
+    fn header_push_back(&mut self, data: &[u8]) {
+        let new_end = self.h_end + data.len();
+        assert!(new_end <= Self::HEADER_CAP, "ZeroCopyMessage header overflow");
+        self.buf[self.h_end..new_end].copy_from_slice(data);
+        self.h_end = new_end;
+    }
+
+    /// Advance the body start pointer by `n` bytes.
+    ///
+    /// This is O(1): no bytes are moved or zeroed. The vacated bytes become
+    /// "trimmed" dead space that is never read again.
+    fn trim_front(&mut self, n: usize) {
+        assert!(self.b_start + n <= self.b_end, "ZeroCopyMessage trim_front out of bounds");
+        self.b_start += n;
+    }
 }

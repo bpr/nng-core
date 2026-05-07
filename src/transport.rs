@@ -1,8 +1,25 @@
-//! `FramedTransport<T>` — wraps any `embedded-io-async` byte stream with SP
+//! [`FramedTransport<T>`] — wraps any `embedded-io-async` byte stream with SP
 //! handshake + message framing.
 //!
 //! After construction via [`FramedTransport::connect`] the handshake has
 //! completed and `send` / `recv` exchange complete SP messages.
+//!
+//! # Frame formats
+//!
+//! The SP handshake is identical for every transport variant. Only the
+//! per-message frame differs:
+//!
+//! | Variant | Header | Used by |
+//! |---|---|---|
+//! | [`FrameFormat::Tcp`] | 8-byte BE u64 length | TCP, loopback, NNG ≥ 2.0 IPC |
+//! | [`FrameFormat::Ipc`] | 1-byte type (`0x01`) + 8-byte BE u64 length | NNG 1.5.x IPC |
+//!
+//! The 9-byte IPC frame header is a NNG 1.5.x implementation detail. NNG 1.5.x
+//! uses Unix domain sockets for IPC and prepends a type byte (`0x01`) before
+//! the length so that future frame types could be distinguished. NNG 2.0 dropped
+//! that type byte and aligns IPC framing with TCP. If you connect to a system
+//! NNG installed from most Linux distributions (which ship 1.5.x), use
+//! [`FrameFormat::Ipc`]; for NNG 2.x use [`FrameFormat::Tcp`].
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -18,20 +35,17 @@ use crate::{
     },
 };
 
-/// Wire framing variant.
+/// Wire framing variant — controls how the per-message length header is encoded.
 ///
-/// The SP handshake is identical for all variants (8-byte `\0SP\0` header).
-/// Only the per-message frame differs:
-///
-/// * `Tcp` — 8-byte BE u64 length, then payload.  Used by all TCP and
-///   loopback connections, and by NNG ≥ 2.0 IPC.
-/// * `Ipc` — 1-byte type (`0x01`) followed by 8-byte BE u64 length, then
-///   payload.  Used by NNG 1.5.x IPC (Unix domain sockets).
+/// The SP handshake (8-byte `\0SP\0` header) is identical for all variants.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FrameFormat {
-    /// 8-byte BE u64 length header (TCP and loopback).
+    /// 8-byte BE u64 length header. Used by TCP connections and by NNG ≥ 2.0
+    /// IPC. Also used by the in-memory loopback transport.
     Tcp,
-    /// 1-byte type (`0x01`) + 8-byte BE u64 length header (NNG 1.5.x IPC).
+    /// 1-byte type (`0x01`) followed by 8-byte BE u64 length. Used by NNG
+    /// 1.5.x IPC (Unix domain sockets). The type byte is validated on receive;
+    /// an unexpected value yields [`TransportError::BadFrameType`].
     Ipc,
 }
 
@@ -44,7 +58,10 @@ pub enum TransportError {
     Io,
     /// The connection was closed before the operation completed.
     Closed,
-    /// The remote sent an unexpected IPC frame type byte.
+    /// The remote sent an IPC frame whose type byte was not `0x01`.
+    ///
+    /// Only returned when using [`FrameFormat::Ipc`]. The inner value is the
+    /// unexpected byte that was received.
     BadFrameType(u8),
 }
 
@@ -67,8 +84,23 @@ impl From<CodecError> for TransportError {
 
 /// A framed SP transport over any `embedded-io-async` `Read + Write` stream.
 ///
-/// After construction the SP handshake has been completed; callers may then
-/// call `send` and `recv` to exchange complete messages.
+/// After [`connect`](Self::connect) returns, the SP handshake has completed and
+/// both sides have verified protocol compatibility. All subsequent `send` /
+/// `recv` calls exchange complete SP messages.
+///
+/// # Send path
+///
+/// `send` transmits the message header bytes immediately before the body bytes,
+/// prefixed by the frame length. The receiver therefore sees header + body as
+/// one contiguous payload and places the entire thing in the received message's
+/// body — the protocol state machine splits them apart later.
+///
+/// # Receive path
+///
+/// `recv` reads the frame header (8 or 9 bytes depending on [`FrameFormat`]),
+/// allocates a buffer of `length` bytes, fills it, and wraps it in a new
+/// [`Message`] whose body is the entire payload. The caller's protocol state
+/// machine then strips its own header fields off the front via `trim_front`.
 pub struct FramedTransport<T> {
     inner: T,
     format: FrameFormat,
@@ -81,14 +113,12 @@ where
     /// Perform the SP handshake and return a ready transport.
     ///
     /// Sends the local protocol's 8-byte header, then reads and validates the
-    /// remote header.  Returns `Err` if the remote's protocol is incompatible.
-    /// The `format` selects the per-message frame layout (see [`FrameFormat`]).
+    /// remote header. Returns `Err` if the remote's protocol is incompatible
+    /// or if I/O fails during the handshake.
     pub async fn connect(mut inner: T, local: ProtocolId, format: FrameFormat) -> Result<Self, TransportError> {
-        // Send our header.
         let tx = encode_handshake(local);
         write_all(&mut inner, &tx).await?;
 
-        // Read remote header.
         let mut rx = [0u8; 8];
         read_exact(&mut inner, &mut rx).await?;
 
@@ -98,7 +128,10 @@ where
         Ok(Self { inner, format })
     }
 
-    /// Send a complete message.  The header bytes are sent before the body.
+    /// Send a complete message.
+    ///
+    /// The frame length covers both `header` and `body`. Header bytes are
+    /// transmitted first, so the remote receives them as a prefix of the body.
     pub async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
         let header = msg.header();
         let body = msg.body();
@@ -117,8 +150,11 @@ where
         Ok(())
     }
 
-    /// Receive a complete message.  All wire bytes (header + body) are placed
-    /// in the message body; the protocol state machine splits them later.
+    /// Receive a complete message.
+    ///
+    /// All wire bytes (header + body concatenated by the sender) are placed
+    /// into the returned message's body. The caller's protocol state machine
+    /// is responsible for stripping protocol header fields from the front.
     pub async fn recv(&mut self) -> Result<Message, TransportError> {
         let len = match self.format {
             FrameFormat::Tcp => {
@@ -153,7 +189,7 @@ where
     }
 }
 
-// ── Helpers ──
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
 async fn write_all<T: Write>(w: &mut T, buf: &[u8]) -> Result<(), TransportError> {
     let mut written = 0;
@@ -179,7 +215,7 @@ async fn read_exact<T: Read>(r: &mut T, buf: &mut [u8]) -> Result<(), TransportE
     Ok(())
 }
 
-// ── Transport submodules ──
+// ── Transport submodules ──────────────────────────────────────────────────────
 
 #[cfg(feature = "std")]
 pub mod tcp;
@@ -187,21 +223,22 @@ pub mod tcp;
 #[cfg(all(feature = "std", unix))]
 pub mod ipc;
 
-// ── In-memory loopback (requires `std` / tokio) ──
+// ── In-memory loopback (requires `std` / tokio) ───────────────────────────────
 
 #[cfg(feature = "std")]
 pub mod loopback {
     //! In-memory loopback transport for testing.
     //!
-    //! `inproc_pair(local, peer)` returns two `FramedTransport`s connected to
-    //! each other via a tokio duplex stream.
+    //! [`inproc_pair`] returns two [`FramedTransport`]s connected back-to-back
+    //! via a tokio duplex stream. Both sides race through the SP handshake
+    //! concurrently; the future resolves when both succeed.
 
     use super::{FrameFormat, FramedTransport, TransportError};
     use crate::codec::ProtocolId;
     use embedded_io_async::{ErrorType, Read, Write};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-    /// Thin wrapper making `tokio::io::DuplexStream` implement
+    /// Thin wrapper making [`tokio::io::DuplexStream`] implement
     /// `embedded-io-async`'s `Read` + `Write`.
     pub struct TokioDuplex(pub DuplexStream);
 
@@ -225,7 +262,7 @@ pub mod loopback {
         }
     }
 
-    /// Create a connected pair of `FramedTransport`s for use in tests.
+    /// Create a connected pair of [`FramedTransport`]s for use in tests.
     ///
     /// Both sides perform the SP handshake concurrently; the future resolves
     /// when both handshakes succeed.

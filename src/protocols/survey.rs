@@ -1,30 +1,50 @@
 //! SURVEYOR0 / RESPONDENT0 protocol state machines.
 //!
-//! ## Wire encoding
-//! Each survey carries a 4-byte survey ID (u32 big-endian) in the header
-//! (so it precedes the body on the wire).  Responses carry back the same
-//! survey ID so the surveyor can correlate them.
+//! # Survey pattern
 //!
-//! SURVEYOR:
-//!   - send: prepend survey_id as u32 BE to header
-//!   - recv: strip 4-byte survey ID from front of body, validate it matches
-//!     current survey; on mismatch the response is stale — discard.
+//! The surveyor broadcasts a query to all connected respondents and collects
+//! their replies within a deadline. This is a fan-out/fan-in pattern: one
+//! sender, many receivers, many replies.
 //!
-//! RESPONDENT:
-//!   - recv: strip survey ID from front of body, save for reply
-//!   - send (respond): prepend saved survey ID to header
+//! # Wire encoding
+//!
+//! Every survey carries a 4-byte **survey ID** (u32 big-endian) prepended to
+//! the message. The ID travels in the message header on send and is stripped
+//! from the front of the body on receive — same convention as REQ/REP.
+//!
+//! ```text
+//! ┌────────────────────┬──────────────────────┐
+//! │  survey ID (4 B)   │   body (variable)    │
+//! └────────────────────┴──────────────────────┘
+//! ```
+//!
+//! Respondents echo the survey ID back in their replies so the surveyor can:
+//! 1. Match the reply to the current survey.
+//! 2. Detect and discard replies to *stale* (already-expired) surveys.
+//!
+//! Unlike REQ/REP, the survey ID does **not** use the high-bit backtrace
+//! mechanism. There is no device-forwarding for surveys in the current spec.
+//!
+//! # Stale reply detection
+//!
+//! The surveyor keeps a single `current_id`. Any response whose ID does not
+//! match is silently discarded with [`SurveyError::StaleSurveyId`]. This
+//! handles network re-ordering, slow respondents, and spurious retransmissions.
 
-use crate::Message;
+use crate::message::MessageBuf;
 use crate::codec::ProtocolId;
 
 pub const PROTOCOL_ID_SURVEYOR: ProtocolId = ProtocolId::SURVEYOR0;
 pub const PROTOCOL_ID_RESPONDENT: ProtocolId = ProtocolId::RESPONDENT0;
 
+/// Errors produced by the SURVEYOR0 / RESPONDENT0 state machines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurveyError {
-    /// Received response for a different (stale) survey.
+    /// Received a response for a different (older) survey.
+    ///
+    /// The surveyor has already moved on; this reply should be discarded.
     StaleSurveyId { got: u32, expected: u32 },
-    /// Message too short to contain a survey ID.
+    /// Message body was shorter than 4 bytes — too short to hold a survey ID.
     MessageTooShort,
 }
 
@@ -40,12 +60,17 @@ impl core::fmt::Display for SurveyError {
     }
 }
 
-// ── Surveyor0 ──
+// ── Surveyor0 ─────────────────────────────────────────────────────────────────
 
-/// State machine for the SURVEYOR0 side.
+/// State machine for the SURVEYOR0 (query) side.
+///
+/// Maintains two pieces of state:
+/// - `next_id` — the ID to assign to the next survey (monotonically increasing,
+///   skips zero, wraps via `wrapping_add(1).max(1)`).
+/// - `current_id` — the ID of the currently active survey. Any response whose
+///   ID does not match is treated as stale and rejected.
 pub struct Surveyor0State {
     next_id: u32,
-    /// ID of the currently active survey (0 = none).
     current_id: u32,
 }
 
@@ -54,8 +79,12 @@ impl Surveyor0State {
         Self { next_id: 1, current_id: 0 }
     }
 
-    /// Prepare a survey message and return the survey ID.
-    pub fn prepare_survey(&mut self, msg: &mut Message) -> u32 {
+    /// Assign a survey ID to an outgoing survey message and return that ID.
+    ///
+    /// Writes the 4-byte ID into the message header. Advances `current_id`
+    /// so that any in-flight responses to previous surveys are now considered
+    /// stale.
+    pub fn prepare_survey<M: MessageBuf>(&mut self, msg: &mut M) -> u32 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.current_id = id;
@@ -63,9 +92,12 @@ impl Surveyor0State {
         id
     }
 
-    /// Process an incoming response.  Returns `Ok(())` if the survey ID
-    /// matches the current survey; discards stale responses.
-    pub fn process_response(&self, msg: &mut Message) -> Result<(), SurveyError> {
+    /// Validate an incoming response and strip the survey ID from the body.
+    ///
+    /// Returns `Ok(())` if the ID matches `current_id`; returns
+    /// [`SurveyError::StaleSurveyId`] if it does not. On success the 4-byte
+    /// ID is consumed and `msg.body()` holds only the response payload.
+    pub fn process_response<M: MessageBuf>(&self, msg: &mut M) -> Result<(), SurveyError> {
         if msg.body().len() < 4 {
             return Err(SurveyError::MessageTooShort);
         }
@@ -77,6 +109,7 @@ impl Surveyor0State {
         Ok(())
     }
 
+    /// The ID of the currently active survey (0 if no survey has been started).
     pub fn current_survey_id(&self) -> u32 {
         self.current_id
     }
@@ -88,13 +121,21 @@ impl Default for Surveyor0State {
     }
 }
 
-// ── Respondent0 ──
+// ── Respondent0 ───────────────────────────────────────────────────────────────
 
-/// Opaque routing info for a survey, needed to send a response.
+/// Opaque routing information extracted from an incoming survey.
+///
+/// Contains the 4-byte survey ID. The respondent must pass this back to
+/// [`Respondent0State::prepare_response`] so the reply is tagged with the
+/// correct ID for the surveyor to correlate.
 #[derive(Debug, Clone)]
 pub struct SurveyRoutingInfo(pub [u8; 4]);
 
-/// State machine for the RESPONDENT0 side.  Stateless between requests.
+/// State machine for the RESPONDENT0 (reply) side. Stateless between surveys.
+///
+/// All per-survey state lives in the [`SurveyRoutingInfo`] returned by
+/// [`process_incoming`](Self::process_incoming), making it easy to handle
+/// surveys in separate tasks or to hold multiple in-flight surveys.
 pub struct Respondent0State;
 
 impl Respondent0State {
@@ -102,9 +143,11 @@ impl Respondent0State {
         Self
     }
 
-    /// Process an incoming survey: extract survey ID from front of body.
-    /// Returns routing info needed to send the response.
-    pub fn process_incoming(&self, msg: &mut Message) -> Result<SurveyRoutingInfo, SurveyError> {
+    /// Strip the survey ID from the front of an incoming survey message.
+    ///
+    /// Returns the [`SurveyRoutingInfo`] needed to send a response. On success
+    /// `msg.body()` holds only the survey payload.
+    pub fn process_incoming<M: MessageBuf>(&self, msg: &mut M) -> Result<SurveyRoutingInfo, SurveyError> {
         if msg.body().len() < 4 {
             return Err(SurveyError::MessageTooShort);
         }
@@ -113,8 +156,11 @@ impl Respondent0State {
         Ok(SurveyRoutingInfo(id_bytes))
     }
 
-    /// Prepare a response: attach the saved survey ID to the reply header.
-    pub fn prepare_response(&self, msg: &mut Message, routing: &SurveyRoutingInfo) {
+    /// Attach the saved survey ID to the response header.
+    ///
+    /// Places the 4-byte ID into the message header so that the surveyor can
+    /// match this response to its active survey.
+    pub fn prepare_response<M: MessageBuf>(&self, msg: &mut M, routing: &SurveyRoutingInfo) {
         msg.header_push_back(&routing.0);
     }
 }
