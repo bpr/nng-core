@@ -58,12 +58,18 @@ impl Req0State {
     /// Prepare an outgoing request: inject the request ID into the message
     /// header (so it becomes part of the wire payload preceding the body).
     /// Returns the ID that was used so the caller can match the reply.
+    ///
+    /// The SP REQ/REP backtrace header terminates at the first 4-byte word
+    /// with the high bit set.  We set it unconditionally (direct connection,
+    /// no device hops).
     pub fn prepare_outgoing(&mut self, msg: &mut Message) -> u32 {
         let id = self.next_id;
         // Increment; wrap but skip 0.
         self.next_id = self.next_id.wrapping_add(1).max(1);
 
-        msg.header_push_back(&id.to_be_bytes());
+        // High bit marks "end of backtrace" in the SP header.
+        let wire_id = id | 0x8000_0000u32;
+        msg.header_push_back(&wire_id.to_be_bytes());
         id
     }
 
@@ -74,8 +80,9 @@ impl Req0State {
         if msg.body().len() < 4 {
             return Err(ReqRepError::MessageTooShort);
         }
-        let id = u32::from_be_bytes(msg.body()[..4].try_into().unwrap());
+        let wire_id = u32::from_be_bytes(msg.body()[..4].try_into().unwrap());
         msg.trim_front(4);
+        let id = wire_id & 0x7fff_ffffu32; // strip the end-of-backtrace flag
         if id != sent_id {
             return Err(ReqRepError::IdMismatch { got: id, expected: sent_id });
         }

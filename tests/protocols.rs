@@ -28,7 +28,8 @@ fn req_rep_roundtrip() {
     // REP receives: strips ID from body front
     let routing = rep.process_incoming(&mut wire_msg).unwrap();
     assert_eq!(wire_msg.body(), b"ping"); // just the payload
-    assert_eq!(u32::from_be_bytes(routing.0), id);
+    // routing.0 contains the wire ID (high bit set = end-of-backtrace marker).
+    assert_eq!(u32::from_be_bytes(routing.0), id | 0x8000_0000u32);
 
     // REP prepares reply
     let mut reply = Message::new();

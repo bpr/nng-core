@@ -18,6 +18,23 @@ use crate::{
     },
 };
 
+/// Wire framing variant.
+///
+/// The SP handshake is identical for all variants (8-byte `\0SP\0` header).
+/// Only the per-message frame differs:
+///
+/// * `Tcp` — 8-byte BE u64 length, then payload.  Used by all TCP and
+///   loopback connections, and by NNG ≥ 2.0 IPC.
+/// * `Ipc` — 1-byte type (`0x01`) followed by 8-byte BE u64 length, then
+///   payload.  Used by NNG 1.5.x IPC (Unix domain sockets).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FrameFormat {
+    /// 8-byte BE u64 length header (TCP and loopback).
+    Tcp,
+    /// 1-byte type (`0x01`) + 8-byte BE u64 length header (NNG 1.5.x IPC).
+    Ipc,
+}
+
 /// Error type for transport-layer operations.
 #[derive(Debug)]
 pub enum TransportError {
@@ -27,6 +44,8 @@ pub enum TransportError {
     Io,
     /// The connection was closed before the operation completed.
     Closed,
+    /// The remote sent an unexpected IPC frame type byte.
+    BadFrameType(u8),
 }
 
 impl core::fmt::Display for TransportError {
@@ -35,6 +54,7 @@ impl core::fmt::Display for TransportError {
             Self::Handshake(e) => write!(f, "SP handshake error: {e}"),
             Self::Io => write!(f, "I/O error"),
             Self::Closed => write!(f, "connection closed"),
+            Self::BadFrameType(t) => write!(f, "unexpected IPC frame type: {t:#04x}"),
         }
     }
 }
@@ -51,6 +71,7 @@ impl From<CodecError> for TransportError {
 /// call `send` and `recv` to exchange complete messages.
 pub struct FramedTransport<T> {
     inner: T,
+    format: FrameFormat,
 }
 
 impl<T> FramedTransport<T>
@@ -61,7 +82,8 @@ where
     ///
     /// Sends the local protocol's 8-byte header, then reads and validates the
     /// remote header.  Returns `Err` if the remote's protocol is incompatible.
-    pub async fn connect(mut inner: T, local: ProtocolId) -> Result<Self, TransportError> {
+    /// The `format` selects the per-message frame layout (see [`FrameFormat`]).
+    pub async fn connect(mut inner: T, local: ProtocolId, format: FrameFormat) -> Result<Self, TransportError> {
         // Send our header.
         let tx = encode_handshake(local);
         write_all(&mut inner, &tx).await?;
@@ -73,7 +95,7 @@ where
         let remote = decode_handshake(&rx)?;
         check_peer(local, remote)?;
 
-        Ok(Self { inner })
+        Ok(Self { inner, format })
     }
 
     /// Send a complete message.  The header bytes are sent before the body.
@@ -82,6 +104,9 @@ where
         let body = msg.body();
         let total = (header.len() + body.len()) as u64;
 
+        if self.format == FrameFormat::Ipc {
+            write_all(&mut self.inner, &[0x01]).await?;
+        }
         write_all(&mut self.inner, &total.to_be_bytes()).await?;
         if !header.is_empty() {
             write_all(&mut self.inner, header).await?;
@@ -95,9 +120,22 @@ where
     /// Receive a complete message.  All wire bytes (header + body) are placed
     /// in the message body; the protocol state machine splits them later.
     pub async fn recv(&mut self) -> Result<Message, TransportError> {
-        let mut len_buf = [0u8; 8];
-        read_exact(&mut self.inner, &mut len_buf).await?;
-        let len = u64::from_be_bytes(len_buf) as usize;
+        let len = match self.format {
+            FrameFormat::Tcp => {
+                let mut buf = [0u8; 8];
+                read_exact(&mut self.inner, &mut buf).await?;
+                u64::from_be_bytes(buf) as usize
+            }
+            FrameFormat::Ipc => {
+                let mut buf = [0u8; 9];
+                read_exact(&mut self.inner, &mut buf).await?;
+                if buf[0] != 0x01 {
+                    return Err(TransportError::BadFrameType(buf[0]));
+                }
+                let len_bytes: [u8; 8] = buf[1..9].try_into().unwrap();
+                u64::from_be_bytes(len_bytes) as usize
+            }
+        };
 
         let mut payload = vec![0u8; len];
         if len > 0 {
@@ -146,6 +184,9 @@ async fn read_exact<T: Read>(r: &mut T, buf: &mut [u8]) -> Result<(), TransportE
 #[cfg(feature = "std")]
 pub mod tcp;
 
+#[cfg(all(feature = "std", unix))]
+pub mod ipc;
+
 // ── In-memory loopback (requires `std` / tokio) ──
 
 #[cfg(feature = "std")]
@@ -155,7 +196,7 @@ pub mod loopback {
     //! `inproc_pair(local, peer)` returns two `FramedTransport`s connected to
     //! each other via a tokio duplex stream.
 
-    use super::{FramedTransport, TransportError};
+    use super::{FrameFormat, FramedTransport, TransportError};
     use crate::codec::ProtocolId;
     use embedded_io_async::{ErrorType, Read, Write};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -197,8 +238,8 @@ pub mod loopback {
     > {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (t1, t2) = tokio::try_join!(
-            FramedTransport::connect(TokioDuplex(a), local),
-            FramedTransport::connect(TokioDuplex(b), peer),
+            FramedTransport::connect(TokioDuplex(a), local, FrameFormat::Tcp),
+            FramedTransport::connect(TokioDuplex(b), peer, FrameFormat::Tcp),
         )
         .map_err(|e| e)?;
         Ok((t1, t2))

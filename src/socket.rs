@@ -1,5 +1,7 @@
 //! High-level socket API for nng-pure (requires `std` / tokio).
 //!
+//! Supported URL schemes: `tcp://host:port` and (Unix only) `ipc:///path`.
+//!
 //! Each socket type is generic over a protocol marker and wraps a
 //! `FramedTransport`.  Listeners can accept multiple connections; for
 //! simplicity, `Socket::listen` accepts exactly **one** connection before
@@ -12,46 +14,183 @@ use std::io;
 
 use tokio::net::{TcpListener, TcpStream};
 
+use embedded_io_async::{ErrorType, Read as EioRead, Write as EioWrite};
+
 use crate::{
     Message,
     codec::ProtocolId,
-    transport::{FramedTransport, TransportError, tcp::TokioTcpStream},
+    transport::{FrameFormat, FramedTransport, TransportError, tcp::TokioTcpStream},
 };
+
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use crate::transport::ipc::TokioUnixStream;
 
 fn transport_error_to_io(e: TransportError) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// Perform the SP handshake on `stream`, selecting the frame format from the
+/// stream's transport type (TCP → 8-byte header, IPC → 9-byte NNG 1.5.x header).
+pub(crate) async fn connect_framed(
+    stream: AnyStream,
+    proto: ProtocolId,
+) -> Result<FramedTransport<AnyStream>, TransportError> {
+    let format = stream.frame_format();
+    FramedTransport::connect(stream, proto, format).await
+}
+
+// ── AnyStream: TCP or IPC behind a single trait impl ──
+
+pub(crate) enum AnyStream {
+    Tcp(TokioTcpStream),
+    #[cfg(unix)]
+    Ipc(TokioUnixStream),
+}
+
+impl ErrorType for AnyStream {
+    type Error = std::io::Error;
+}
+
+impl EioRead for AnyStream {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        match self {
+            Self::Tcp(s) => EioRead::read(s, buf).await,
+            #[cfg(unix)]
+            Self::Ipc(s) => EioRead::read(s, buf).await,
+        }
+    }
+}
+
+impl EioWrite for AnyStream {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        match self {
+            Self::Tcp(s) => EioWrite::write(s, buf).await,
+            #[cfg(unix)]
+            Self::Ipc(s) => EioWrite::write(s, buf).await,
+        }
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        match self {
+            Self::Tcp(s) => EioWrite::flush(s).await,
+            #[cfg(unix)]
+            Self::Ipc(s) => EioWrite::flush(s).await,
+        }
+    }
+}
+
+impl AnyStream {
+    fn frame_format(&self) -> FrameFormat {
+        match self {
+            Self::Tcp(_) => FrameFormat::Tcp,
+            #[cfg(unix)]
+            Self::Ipc(_) => FrameFormat::Ipc,
+        }
+    }
+}
+
+// ── AnyListener: TCP or IPC, with a unified accept() ──
+
+pub(crate) enum AnyListener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Ipc(UnixListener),
+}
+
+impl AnyListener {
+    pub(crate) async fn accept(&self) -> io::Result<AnyStream> {
+        match self {
+            Self::Tcp(l) => {
+                let (stream, _) = l.accept().await?;
+                Ok(AnyStream::Tcp(TokioTcpStream(stream)))
+            }
+            #[cfg(unix)]
+            Self::Ipc(l) => {
+                let (stream, _) = l.accept().await?;
+                Ok(AnyStream::Ipc(TokioUnixStream(stream)))
+            }
+        }
+    }
+}
+
+// ── URL dispatch helpers ──
+
+pub(crate) async fn bind_listener(addr: &str) -> io::Result<AnyListener> {
+    if let Some(tcp_addr) = addr.strip_prefix("tcp://") {
+        TcpListener::bind(tcp_addr).await.map(AnyListener::Tcp)
+    } else if let Some(ipc_path) = addr.strip_prefix("ipc://") {
+        bind_ipc_listener(ipc_path)
+    } else {
+        Err(io::Error::other(format!("unsupported URL scheme: {addr}")))
+    }
+}
+
+pub(crate) async fn connect_stream(addr: &str) -> io::Result<AnyStream> {
+    if let Some(tcp_addr) = addr.strip_prefix("tcp://") {
+        TcpStream::connect(tcp_addr)
+            .await
+            .map(|s| AnyStream::Tcp(TokioTcpStream(s)))
+    } else if let Some(ipc_path) = addr.strip_prefix("ipc://") {
+        connect_ipc_stream(ipc_path).await
+    } else {
+        Err(io::Error::other(format!("unsupported URL scheme: {addr}")))
+    }
+}
+
+#[cfg(unix)]
+fn bind_ipc_listener(path: &str) -> io::Result<AnyListener> {
+    // Remove a stale socket file left by a prior crash, matching libnng behaviour.
+    let _ = std::fs::remove_file(path);
+    UnixListener::bind(path).map(AnyListener::Ipc)
+}
+
+#[cfg(not(unix))]
+fn bind_ipc_listener(_path: &str) -> io::Result<AnyListener> {
+    Err(io::Error::other("IPC (Unix domain sockets) is not supported on this platform"))
+}
+
+#[cfg(unix)]
+async fn connect_ipc_stream(path: &str) -> io::Result<AnyStream> {
+    UnixStream::connect(path)
+        .await
+        .map(|s| AnyStream::Ipc(TokioUnixStream(s)))
+}
+
+#[cfg(not(unix))]
+async fn connect_ipc_stream(_path: &str) -> io::Result<AnyStream> {
+    Err(io::Error::other("IPC (Unix domain sockets) is not supported on this platform"))
+}
+
+// ── Socket<P> ──
+
 /// A connected socket wrapping a single `FramedTransport`.
 pub struct Socket<P> {
-    transport: FramedTransport<TokioTcpStream>,
+    transport: FramedTransport<AnyStream>,
     _protocol: core::marker::PhantomData<P>,
 }
 
 impl<P> Socket<P> {
-    fn new(transport: FramedTransport<TokioTcpStream>) -> Self {
+    fn new(transport: FramedTransport<AnyStream>) -> Self {
         Self { transport, _protocol: core::marker::PhantomData }
     }
 
-    /// Bind a TCP listener and wait for the first incoming connection,
-    /// perform the SP handshake, then return the connected `Socket`.
-    ///
-    /// The listener is dropped after accepting one connection.
+    /// Bind and wait for the first incoming connection, then perform the SP
+    /// handshake.  The listener is dropped after accepting one connection.
     pub async fn listen(addr: &str, proto: ProtocolId) -> io::Result<Self> {
-        let addr = addr.trim_start_matches("tcp://");
-        let listener = TcpListener::bind(addr).await?;
-        let (stream, _peer) = listener.accept().await?;
-        let transport = FramedTransport::connect(TokioTcpStream(stream), proto)
+        let listener = bind_listener(addr).await?;
+        let stream = listener.accept().await?;
+        let transport = connect_framed(stream, proto)
             .await
             .map_err(transport_error_to_io)?;
         Ok(Self::new(transport))
     }
 
-    /// Dial a TCP address and perform the SP handshake.
+    /// Connect to `addr` and perform the SP handshake.
     pub async fn dial(addr: &str, proto: ProtocolId) -> io::Result<Self> {
-        let addr = addr.trim_start_matches("tcp://");
-        let stream = TcpStream::connect(addr).await?;
-        let transport = FramedTransport::connect(TokioTcpStream(stream), proto)
+        let stream = connect_stream(addr).await?;
+        let transport = connect_framed(stream, proto)
             .await
             .map_err(transport_error_to_io)?;
         Ok(Self::new(transport))
@@ -78,14 +217,14 @@ pub mod pubsub0 {
 
     use std::io;
 
-    use tokio::net::{TcpListener, TcpStream};
-
     use crate::{
         Message,
         codec::ProtocolId,
         protocols::pubsub::Sub0State,
-        transport::{FramedTransport, TransportError, tcp::TokioTcpStream},
+        transport::{FramedTransport, TransportError},
     };
+
+    use super::{AnyListener, AnyStream, bind_listener, connect_framed, connect_stream};
 
     fn te(e: TransportError) -> io::Error {
         io::Error::other(e.to_string())
@@ -93,23 +232,22 @@ pub mod pubsub0 {
 
     /// Publish socket: listens for subscriber connections, fans out messages.
     pub struct Pub0 {
-        listener: TcpListener,
-        subscribers: Vec<FramedTransport<TokioTcpStream>>,
+        listener: AnyListener,
+        subscribers: Vec<FramedTransport<AnyStream>>,
     }
 
     impl Pub0 {
         /// Bind to `addr` and start accepting subscriber connections.
         pub async fn listen(addr: &str) -> io::Result<Self> {
-            let addr = addr.trim_start_matches("tcp://");
-            let listener = TcpListener::bind(addr).await?;
+            let listener = bind_listener(addr).await?;
             Ok(Self { listener, subscribers: Vec::new() })
         }
 
         /// Block until at least `n` subscribers have completed the SP handshake.
         pub async fn wait_for_subscribers(&mut self, n: usize) -> io::Result<()> {
             while self.subscribers.len() < n {
-                let (stream, _) = self.listener.accept().await?;
-                match FramedTransport::connect(TokioTcpStream(stream), ProtocolId::PUB0).await {
+                let stream = self.listener.accept().await?;
+                match connect_framed(stream, ProtocolId::PUB0).await {
                     Ok(t) => self.subscribers.push(t),
                     Err(_) => {}
                 }
@@ -122,11 +260,9 @@ pub mod pubsub0 {
             loop {
                 tokio::select! {
                     biased;
-                    conn = self.listener.accept() => {
-                        if let Ok((stream, _)) = conn {
-                            if let Ok(t) = FramedTransport::connect(
-                                TokioTcpStream(stream), ProtocolId::PUB0,
-                            ).await {
+                    stream = self.listener.accept() => {
+                        if let Ok(stream) = stream {
+                            if let Ok(t) = connect_framed(stream, ProtocolId::PUB0).await {
                                 self.subscribers.push(t);
                             }
                         }
@@ -162,18 +298,15 @@ pub mod pubsub0 {
 
     /// Subscribe socket: connects to a publisher, filters by topic prefix.
     pub struct Sub0 {
-        transport: FramedTransport<TokioTcpStream>,
+        transport: FramedTransport<AnyStream>,
         state: Sub0State,
     }
 
     impl Sub0 {
         /// Connect to the publisher at `addr`.
         pub async fn dial(addr: &str) -> io::Result<Self> {
-            let addr = addr.trim_start_matches("tcp://");
-            let stream = TcpStream::connect(addr).await?;
-            let transport = FramedTransport::connect(TokioTcpStream(stream), ProtocolId::SUB0)
-                .await
-                .map_err(te)?;
+            let stream = connect_stream(addr).await?;
+            let transport = connect_framed(stream, ProtocolId::SUB0).await.map_err(te)?;
             Ok(Self { transport, state: Sub0State::new() })
         }
 
@@ -214,14 +347,14 @@ pub mod survey0 {
 
     use std::{io, time::Duration};
 
-    use tokio::net::{TcpListener, TcpStream};
-
     use crate::{
         Message,
         codec::ProtocolId,
         protocols::survey::{Respondent0State, Surveyor0State, SurveyRoutingInfo},
-        transport::{FramedTransport, TransportError, tcp::TokioTcpStream},
+        transport::{FramedTransport, TransportError},
     };
+
+    use super::{AnyListener, AnyStream, bind_listener, connect_framed, connect_stream};
 
     fn te(e: TransportError) -> io::Error {
         io::Error::other(e.to_string())
@@ -229,24 +362,23 @@ pub mod survey0 {
 
     /// Surveyor socket: broadcasts surveys to multiple respondents.
     pub struct Surveyor0 {
-        listener: TcpListener,
-        respondents: Vec<FramedTransport<TokioTcpStream>>,
+        listener: AnyListener,
+        respondents: Vec<FramedTransport<AnyStream>>,
         state: Surveyor0State,
     }
 
     impl Surveyor0 {
         /// Bind and start accepting respondent connections.
         pub async fn listen(addr: &str) -> io::Result<Self> {
-            let addr = addr.trim_start_matches("tcp://");
-            let listener = TcpListener::bind(addr).await?;
+            let listener = bind_listener(addr).await?;
             Ok(Self { listener, respondents: Vec::new(), state: Surveyor0State::new() })
         }
 
         /// Block until at least `n` respondents have connected.
         pub async fn wait_for_respondents(&mut self, n: usize) -> io::Result<()> {
             while self.respondents.len() < n {
-                let (stream, _) = self.listener.accept().await?;
-                match FramedTransport::connect(TokioTcpStream(stream), ProtocolId::SURVEYOR0).await {
+                let stream = self.listener.accept().await?;
+                match connect_framed(stream, ProtocolId::SURVEYOR0).await {
                     Ok(t) => self.respondents.push(t),
                     Err(_) => {}
                 }
@@ -265,7 +397,6 @@ pub mod survey0 {
 
             let deadline = tokio::time::Instant::now() + timeout;
 
-            // Fan out to all respondents.
             let mut active: Vec<usize> = Vec::new();
             for (i, resp) in self.respondents.iter_mut().enumerate() {
                 if resp.send(&outgoing).await.is_ok() {
@@ -273,7 +404,6 @@ pub mod survey0 {
                 }
             }
 
-            // Collect one response per active respondent within the deadline.
             let mut responses = Vec::new();
             for i in active {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -296,7 +426,7 @@ pub mod survey0 {
 
     /// One-shot handle that allows sending a single response to the active survey.
     pub struct SurveyHandle<'a> {
-        transport: &'a mut FramedTransport<TokioTcpStream>,
+        transport: &'a mut FramedTransport<AnyStream>,
         routing: SurveyRoutingInfo,
     }
 
@@ -312,19 +442,15 @@ pub mod survey0 {
 
     /// Respondent socket: dials a surveyor, receives surveys, sends responses.
     pub struct Respondent0 {
-        transport: FramedTransport<TokioTcpStream>,
+        transport: FramedTransport<AnyStream>,
         state: Respondent0State,
     }
 
     impl Respondent0 {
         /// Connect to a surveyor at `addr`.
         pub async fn dial(addr: &str) -> io::Result<Self> {
-            let addr = addr.trim_start_matches("tcp://");
-            let stream = TcpStream::connect(addr).await?;
-            let transport =
-                FramedTransport::connect(TokioTcpStream(stream), ProtocolId::RESPONDENT0)
-                    .await
-                    .map_err(te)?;
+            let stream = connect_stream(addr).await?;
+            let transport = connect_framed(stream, ProtocolId::RESPONDENT0).await.map_err(te)?;
             Ok(Self { transport, state: Respondent0State::new() })
         }
 
@@ -353,13 +479,13 @@ pub mod bus0 {
 
     use std::io;
 
-    use tokio::net::{TcpListener, TcpStream};
-
     use crate::{
         Message,
         codec::ProtocolId,
-        transport::{FramedTransport, TransportError, tcp::TokioTcpStream},
+        transport::{FramedTransport, TransportError},
     };
+
+    use super::{AnyListener, AnyStream, bind_listener, connect_framed, connect_stream};
 
     fn te(e: TransportError) -> io::Error {
         io::Error::other(e.to_string())
@@ -367,7 +493,7 @@ pub mod bus0 {
 
     /// A BUS0 node that can be connected to any number of peers.
     pub struct Bus0 {
-        peers: Vec<FramedTransport<TokioTcpStream>>,
+        peers: Vec<FramedTransport<AnyStream>>,
     }
 
     impl Bus0 {
@@ -378,12 +504,11 @@ pub mod bus0 {
 
         /// Bind and accept `n` peer connections before returning.
         pub async fn listen_and_accept(addr: &str, n: usize) -> io::Result<Self> {
-            let addr = addr.trim_start_matches("tcp://");
-            let listener = TcpListener::bind(addr).await?;
+            let listener: AnyListener = bind_listener(addr).await?;
             let mut peers = Vec::with_capacity(n);
             while peers.len() < n {
-                let (stream, _) = listener.accept().await?;
-                match FramedTransport::connect(TokioTcpStream(stream), ProtocolId::BUS0).await {
+                let stream = listener.accept().await?;
+                match connect_framed(stream, ProtocolId::BUS0).await {
                     Ok(t) => peers.push(t),
                     Err(_) => {}
                 }
@@ -393,10 +518,8 @@ pub mod bus0 {
 
         /// Dial one peer and return a `Bus0` with that single connection.
         pub async fn dial(addr: &str) -> io::Result<Self> {
-            let addr = addr.trim_start_matches("tcp://");
-            let stream = TcpStream::connect(addr).await?;
-            let transport =
-                FramedTransport::connect(TokioTcpStream(stream), ProtocolId::BUS0).await.map_err(te)?;
+            let stream = connect_stream(addr).await?;
+            let transport = connect_framed(stream, ProtocolId::BUS0).await.map_err(te)?;
             Ok(Self { peers: vec![transport] })
         }
 
@@ -435,7 +558,6 @@ pub mod bus0 {
                     match poll_result {
                         Some(Ok(msg)) => return Ok(msg),
                         Some(Err(_)) => {
-                            // Dead connection — remove and try remaining peers.
                             self.peers.swap_remove(i);
                         }
                         None => {

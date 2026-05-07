@@ -1,7 +1,7 @@
 use nng_pure::{
     Message,
     codec::ProtocolId,
-    transport::loopback::inproc_pair,
+    transport::{FrameFormat, loopback::inproc_pair},
 };
 
 #[tokio::test]
@@ -63,8 +63,8 @@ async fn loopback_protocol_mismatch_is_error() {
 
     let (a, b) = tokio::io::duplex(64 * 1024);
     let result = tokio::try_join!(
-        FramedTransport::connect(TokioDuplex(a), ProtocolId::REQ0),
-        FramedTransport::connect(TokioDuplex(b), ProtocolId::PUB0),
+        FramedTransport::connect(TokioDuplex(a), ProtocolId::REQ0, FrameFormat::Tcp),
+        FramedTransport::connect(TokioDuplex(b), ProtocolId::PUB0, FrameFormat::Tcp),
     );
     assert!(result.is_err());
 }
@@ -75,8 +75,8 @@ async fn loopback_large_message() {
     use nng_pure::transport::{FramedTransport, loopback::TokioDuplex};
     let (a_stream, b_stream) = tokio::io::duplex(256 * 1024);
     let (mut a, mut b) = tokio::try_join!(
-        FramedTransport::connect(TokioDuplex(a_stream), ProtocolId::PAIR0),
-        FramedTransport::connect(TokioDuplex(b_stream), ProtocolId::PAIR0),
+        FramedTransport::connect(TokioDuplex(a_stream), ProtocolId::PAIR0, FrameFormat::Tcp),
+        FramedTransport::connect(TokioDuplex(b_stream), ProtocolId::PAIR0, FrameFormat::Tcp),
     )
     .unwrap();
 
