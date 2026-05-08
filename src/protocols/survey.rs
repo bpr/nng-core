@@ -128,7 +128,7 @@ impl Default for Surveyor0State {
 /// Contains the 4-byte survey ID. The respondent must pass this back to
 /// [`Respondent0State::prepare_response`] so the reply is tagged with the
 /// correct ID for the surveyor to correlate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurveyRoutingInfo(pub [u8; 4]);
 
 /// State machine for the RESPONDENT0 (reply) side. Stateless between surveys.

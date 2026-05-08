@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`nng-core` is a pure-Rust, `no_std`-compatible implementation of the [NNG Scalability Protocols](https://nng.nanomsg.org/). It was spun out of the `nng-rs` workspace (at `/home/bpr/src/rust/repositories/nng-rs`) where it lived as the `nng-pure` crate. The rename from `nng-pure` → `nng-core` happened in the spin-out commit.
+`nng-core` is a pure-Rust, `no_std`-compatible implementation of the [NNG Scalability Protocols](https://nng.nanomsg.org/). It was spun out of a fork of `nng-rs` where it lived as the `nng-pure` crate. The rename from `nng-pure` to `nng-core` happened in the spin-out commit.
 
 GitHub: https://github.com/bpr/nng-core  
 Default branch: **`master`** (not `main`)
