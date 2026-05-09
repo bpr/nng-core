@@ -3,7 +3,7 @@
 //! A hub node accepts two spoke nodes; it broadcasts a message to both and
 //! then each spoke broadcasts a reply back.
 //!
-//! Run with:  cargo run -p nng-core --example bus
+//! Run with:  cargo run --example bus
 
 use std::fmt::Write;
 

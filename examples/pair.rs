@@ -2,7 +2,7 @@
 //!
 //! Two tasks exchange messages in both directions simultaneously.
 //!
-//! Run with:  cargo run -p nng-core --example pair
+//! Run with:  cargo run --example pair
 
 use std::fmt::Write;
 

@@ -3,7 +3,7 @@
 //! Surveyor broadcasts a "status?" query; two respondents reply with their
 //! identities.  The surveyor prints all responses.
 //!
-//! Run with:  cargo run -p nng-core --example survey
+//! Run with:  cargo run --example survey
 
 use std::fmt::Write;
 use std::time::Duration;

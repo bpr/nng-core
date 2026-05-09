@@ -2,7 +2,7 @@
 //!
 //! A pusher distributes 8 tasks to a puller, which processes each one.
 //!
-//! Run with:  cargo run -p nng-core --example pipeline
+//! Run with:  cargo run --example pipeline
 
 use std::fmt::Write;
 

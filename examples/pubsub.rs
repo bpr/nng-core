@@ -3,7 +3,7 @@
 //! A publisher broadcasts messages with different topic prefixes.
 //! Two subscribers each filter to a single topic and print what they receive.
 //!
-//! Run with:  cargo run -p nng-core --example pubsub
+//! Run with:  cargo run --example pubsub
 
 use std::fmt::Write;
 

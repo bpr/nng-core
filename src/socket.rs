@@ -386,6 +386,26 @@ pub mod survey0 {
             Ok(())
         }
 
+        /// Accept any respondents that connected since the last call.
+        ///
+        /// Returns immediately when the kernel's accept queue is empty.
+        /// Safe to cancel: `TcpListener::accept` does not consume partial data.
+        pub async fn accept_pending(&mut self) {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = self.listener.accept() => {
+                        if let Ok(stream) = result {
+                            if let Ok(t) = connect_framed(stream, ProtocolId::SURVEYOR0).await {
+                                self.respondents.push(t);
+                            }
+                        }
+                    }
+                    _ = std::future::ready(()) => break,
+                }
+            }
+        }
+
         /// Broadcast `msg` as a survey; collect all responses arriving within
         /// `timeout`.  Returns the set of application-level response bodies.
         ///
@@ -589,8 +609,10 @@ pub mod bus0 {
 pub mod pipeline0 {
     //! PUSH0 / PULL0 socket API (pipeline pattern).
     //!
-    //! `Push0` sends work items; `Pull0` receives them.  No headers are added;
-    //! framing is handled by `FramedTransport`.
+    //! `Push0` / `Pull0` handle a single connection each.  `Push0Fan` and
+    //! `Pull0Fan` handle N connections: `Push0Fan` round-robins outgoing
+    //! messages across N pullers; `Pull0Fan` receives from whichever of N
+    //! pushers has data available first.
 
     use std::io;
 
@@ -599,9 +621,16 @@ pub mod pipeline0 {
         codec::ProtocolId,
         protocols::pipeline::{Pull0State, Push0State},
         socket::Socket,
+        transport::{FramedTransport, TransportError},
     };
 
-    /// Push socket: sends messages to a connected pull endpoint.
+    use super::{AnyStream, bind_listener, connect_framed};
+
+    fn te(e: TransportError) -> io::Error {
+        io::Error::other(e.to_string())
+    }
+
+    /// Push socket: sends messages to a single connected pull endpoint.
     pub struct Push0(Socket<Push0State>);
 
     impl Push0 {
@@ -618,7 +647,7 @@ pub mod pipeline0 {
         }
     }
 
-    /// Pull socket: receives messages from a connected push endpoint.
+    /// Pull socket: receives messages from a single connected push endpoint.
     pub struct Pull0(Socket<Pull0State>);
 
     impl Pull0 {
@@ -632,6 +661,102 @@ pub mod pipeline0 {
 
         pub async fn pull(&mut self) -> io::Result<Message> {
             self.0.recv_raw().await
+        }
+    }
+
+    /// Multi-worker push socket: distributes messages across N connected
+    /// pullers in round-robin order.
+    pub struct Push0Fan {
+        workers: Vec<FramedTransport<AnyStream>>,
+        next: usize,
+    }
+
+    impl Push0Fan {
+        /// Bind to `addr` and block until exactly `n` PULL connections have
+        /// completed the SP handshake.
+        pub async fn listen_and_accept(addr: &str, n: usize) -> io::Result<Self> {
+            let listener = bind_listener(addr).await?;
+            let mut workers = Vec::with_capacity(n);
+            while workers.len() < n {
+                let stream = listener.accept().await?;
+                if let Ok(t) = connect_framed(stream, ProtocolId::PUSH0).await {
+                    workers.push(t);
+                }
+            }
+            Ok(Self { workers, next: 0 })
+        }
+
+        /// Send `msg` to the next worker in round-robin order.
+        pub async fn push(&mut self, msg: Message) -> io::Result<()> {
+            if self.workers.is_empty() {
+                return Err(io::Error::other("no workers connected"));
+            }
+            let i = self.next;
+            self.next = (self.next + 1) % self.workers.len();
+            self.workers[i].send(&msg).await.map_err(te)
+        }
+
+        /// Number of connected workers.
+        pub fn worker_count(&self) -> usize {
+            self.workers.len()
+        }
+    }
+
+    /// Multi-sender pull socket: accepts N pushers and receives from whichever
+    /// has data available first.
+    ///
+    /// Each connected sender runs in its own tokio task so `recv()` is never
+    /// cancelled mid-read (which would corrupt TCP frame boundaries).
+    pub struct Pull0Fan {
+        rx: tokio::sync::mpsc::Receiver<io::Result<Message>>,
+        n: usize,
+    }
+
+    impl Pull0Fan {
+        /// Bind to `addr` and block until exactly `n` PUSH connections have
+        /// completed the SP handshake.
+        pub async fn listen_and_accept(addr: &str, n: usize) -> io::Result<Self> {
+            let listener = bind_listener(addr).await?;
+            let (tx, rx) = tokio::sync::mpsc::channel(n * 4);
+            let mut count = 0;
+            while count < n {
+                let stream = listener.accept().await?;
+                if let Ok(mut transport) = connect_framed(stream, ProtocolId::PULL0).await {
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match transport.recv().await {
+                                Ok(msg) => { if tx2.send(Ok(msg)).await.is_err() { break; } }
+                                Err(e) => {
+                                    let _ = tx2.send(Err(te(e))).await;
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    count += 1;
+                }
+            }
+            Ok(Self { rx, n })
+        }
+
+        /// Receive the next message from any connected sender.
+        ///
+        /// Skips sender-disconnect errors so callers keep receiving from the
+        /// remaining live senders.  Returns `Err` only when all senders are gone.
+        pub async fn pull_any(&mut self) -> io::Result<Message> {
+            loop {
+                match self.rx.recv().await {
+                    None => return Err(io::Error::other("all senders disconnected")),
+                    Some(Ok(msg)) => return Ok(msg),
+                    Some(Err(_)) => {} // one sender disconnected, drain remaining
+                }
+            }
+        }
+
+        /// Number of senders accepted at construction time.
+        pub fn sender_count(&self) -> usize {
+            self.n
         }
     }
 }

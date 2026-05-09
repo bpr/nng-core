@@ -1,7 +1,7 @@
 //! REQ/REP example — mirrors anng/examples/async_reqrep.rs
 //!
 //! Two tokio tasks communicate over TCP using the REQ/REP pattern.
-//! Run with:  cargo run -p nng-core --example req-rep
+//! Run with:  cargo run --example req-rep
 
 use std::fmt::Write;
 

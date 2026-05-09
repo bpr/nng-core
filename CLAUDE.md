@@ -15,7 +15,7 @@ Default branch: **`master`** (not `main`)
 # Build
 cargo build
 
-# Run all tests
+# Run all tests (129 tests across all suites)
 cargo test
 
 # Run a specific test file
@@ -26,13 +26,9 @@ cargo test --test transport
 # Run interop tests (require nngcat from system NNG 1.5.x)
 cargo test --test interop_nngcat
 
-# Run a single example
-cargo run --example req-rep
-cargo run --example pubsub
-cargo run --example pipeline
-cargo run --example pair
-cargo run --example survey
-cargo run --example bus
+# Run a single example (see README.md for start order of multi-process examples)
+cargo run --example req_server
+cargo run --example req_client
 
 # Verify no_std core compiles without std/alloc
 cargo build --no-default-features
@@ -68,14 +64,37 @@ Four layers, each with a single responsibility:
 
 `tests/interop_nngcat.rs` runs 8 tests against `nngcat` (the NNG 1.5.2 CLI tool from the system package). These require `nngcat` to be in `PATH`. They cover REQ/REP, PUSH/PULL, and PUB/SUB over both TCP and IPC.
 
-## Known issues / pending work
+## Bugs found and fixed during example testing
 
-The `README.md` needs fixes before the next release:
+### `Pull0Fan::pull_any` — cancellation-unsafe poll loop
 
-1. **"clean-room" (line 9)** — inaccurate; we read NNG source to figure out the IPC frame format and protocol IDs. Change to "pure-Rust reimplementation".
-2. **Workspace reference (line 16)** — "long-term goal is for `nng` and `anng` to use `nng-core`…" refers to the old `nng-rs` workspace. Remove or reframe for a standalone crate.
-3. **`-p nng-core` flags (lines 115–128)** — workspace flag, wrong for a standalone crate. Drop the `-p nng-core`.
-4. **Test count "75 tests" (line 127)** — now 98 tests.
+**Location:** `src/socket.rs`, `pipeline0::Pull0Fan`
+
+**Symptom:** The sink process aborted with `memory allocation of 3684054924945334370 bytes failed` as soon as the first worker sent a message.
+
+**Root cause:** The original implementation polled each sender with:
+```rust
+tokio::select! {
+    biased;
+    r = self.senders[i].recv() => Some(r),
+    _ = std::future::ready(()) => None,
+}
+```
+`FramedTransport::recv` performs multiple `read_exact` calls (8 bytes for the length header, then N bytes for the payload). With `biased` and `ready(())` as the fallback, the `recv` future is polled once and then dropped if it returns `Pending`. `tokio::io::read_exact` is not cancellation-safe: it advances the stream position as it reads, so dropping the future mid-read consumes partial bytes from the TCP socket. The next `recv` call then reads the remaining payload bytes as the start of a new frame header, producing a garbage length field.
+
+**Fix:** Each sender now runs in its own `tokio::spawn` task that drives `recv` to completion and forwards messages (or a disconnect error) into an `mpsc::Receiver`. `pull_any` simply awaits the channel — no future is ever cancelled mid-read.
+
+---
+
+### `Surveyor0::accept_pending` — new connections ignored after first survey round
+
+**Location:** `src/socket.rs`, `survey0::Surveyor0`; `examples/discovery_registry.rs`
+
+**Symptom:** When two nodes connected to the discovery registry simultaneously, only one appeared in survey responses. Nodes that connected after the first survey round were never seen.
+
+**Root cause:** `wait_for_respondents(n)` accepts exactly `n` connections and then returns. Subsequent connections arrive at the OS TCP layer and sit in the kernel accept queue, but the application never calls `accept()` again, so no SP handshake runs and those connections are invisible to `survey()`.
+
+**Fix:** Added `Surveyor0::accept_pending()`, which drains the kernel accept queue in a non-blocking loop using `select! { biased; listener.accept() => ..., ready(()) => break }`. Unlike `FramedTransport::recv`, `TcpListener::accept` does not consume partial data, so cancelling it between iterations is safe. The `discovery_registry` example calls `accept_pending()` at the top of each survey loop, so nodes that join between rounds are included in the next survey.
 
 ## no_std status
 
