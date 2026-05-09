@@ -25,6 +25,8 @@
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 use embedded_io_async::{Read, Write};
 
@@ -80,6 +82,43 @@ impl From<CodecError> for TransportError {
     }
 }
 
+/// Per-field receive state for cancellation-safe `recv`.
+///
+/// Stored inside [`FramedTransport`] so that partial reads survive future
+/// cancellation.  If a `recv()` future is dropped (e.g. by a `select!` branch
+/// that fires before the recv completes), the bytes already pulled from the
+/// underlying stream are preserved here.  The next `recv()` call resumes from
+/// exactly where the cancelled one left off instead of starting a fresh read
+/// that would treat mid-frame bytes as a new frame header.
+struct RecvBuf {
+    phase: RecvPhase,
+    /// Scratch space for the length header (max 9 bytes for IPC format).
+    len_buf: [u8; 9],
+    len_filled: usize,
+    /// Growing payload buffer; allocated once the frame length is known.
+    body: Vec<u8>,
+    body_filled: usize,
+}
+
+#[derive(PartialEq)]
+enum RecvPhase {
+    Idle,
+    Len,
+    Body,
+}
+
+impl Default for RecvBuf {
+    fn default() -> Self {
+        Self {
+            phase: RecvPhase::Idle,
+            len_buf: [0u8; 9],
+            len_filled: 0,
+            body: Vec::new(),
+            body_filled: 0,
+        }
+    }
+}
+
 /// A framed SP transport over any `embedded-io-async` `Read + Write` stream.
 ///
 /// After [`connect`](Self::connect) returns, the SP handshake has completed and
@@ -99,9 +138,15 @@ impl From<CodecError> for TransportError {
 /// allocates a buffer of `length` bytes, fills it, and wraps it in a new
 /// [`Message`] whose body is the entire payload. The caller's protocol state
 /// machine then strips its own header fields off the front via `trim_front`.
+///
+/// `recv` is **cancellation-safe**: partial reads are buffered in the
+/// [`RecvBuf`] stored inside the transport.  Dropping a `recv` future
+/// mid-read and calling `recv` again on the same transport is safe and will
+/// produce exactly one complete message, not a corrupted one.
 pub struct FramedTransport<T> {
     inner: T,
     format: FrameFormat,
+    rx: RecvBuf,
 }
 
 impl<T> FramedTransport<T>
@@ -127,7 +172,11 @@ where
         let remote = decode_handshake(&rx)?;
         check_peer(local, remote)?;
 
-        Ok(Self { inner, format })
+        Ok(Self {
+            inner,
+            format,
+            rx: RecvBuf::default(),
+        })
     }
 
     /// Send a complete message.
@@ -157,28 +206,75 @@ where
     /// All wire bytes (header + body concatenated by the sender) are placed
     /// into the returned message's body. The caller's protocol state machine
     /// is responsible for stripping protocol header fields from the front.
+    ///
+    /// This method is **cancellation-safe**: if the returned future is dropped
+    /// before it resolves, any bytes already read from the stream are retained
+    /// in the transport's internal [`RecvBuf`].  The next call to `recv` picks
+    /// up exactly where the cancelled call left off.
     pub async fn recv(&mut self) -> Result<Message, TransportError> {
-        let len = match self.format {
-            FrameFormat::Tcp => {
-                let mut buf = [0u8; 8];
-                read_exact(&mut self.inner, &mut buf).await?;
-                u64::from_be_bytes(buf) as usize
-            }
-            FrameFormat::Ipc => {
-                let mut buf = [0u8; 9];
-                read_exact(&mut self.inner, &mut buf).await?;
-                if buf[0] != 0x01 {
-                    return Err(TransportError::BadFrameType(buf[0]));
-                }
-                let len_bytes: [u8; 8] = buf[1..9].try_into().unwrap();
-                u64::from_be_bytes(len_bytes) as usize
-            }
+        let needed = match self.format {
+            FrameFormat::Tcp => 8usize,
+            FrameFormat::Ipc => 9usize,
         };
 
-        let mut payload = vec![0u8; len];
-        if len > 0 {
-            read_exact(&mut self.inner, &mut payload).await?;
+        // Phase 1 — read the frame-length header into self.rx.len_buf.
+        if self.rx.phase == RecvPhase::Idle {
+            self.rx.len_filled = 0;
+            self.rx.phase = RecvPhase::Len;
         }
+
+        if self.rx.phase == RecvPhase::Len {
+            while self.rx.len_filled < needed {
+                // Borrow inner and len_buf as disjoint fields.
+                let filled = self.rx.len_filled;
+                let n = self
+                    .inner
+                    .read(&mut self.rx.len_buf[filled..needed])
+                    .await
+                    .map_err(|_| TransportError::Io)?;
+                if n == 0 {
+                    return Err(TransportError::Closed);
+                }
+                self.rx.len_filled += n;
+            }
+
+            let payload_len = match self.format {
+                FrameFormat::Tcp => {
+                    let bytes: [u8; 8] = self.rx.len_buf[..8].try_into().unwrap();
+                    u64::from_be_bytes(bytes) as usize
+                }
+                FrameFormat::Ipc => {
+                    if self.rx.len_buf[0] != 0x01 {
+                        self.rx.phase = RecvPhase::Idle;
+                        return Err(TransportError::BadFrameType(self.rx.len_buf[0]));
+                    }
+                    let bytes: [u8; 8] = self.rx.len_buf[1..9].try_into().unwrap();
+                    u64::from_be_bytes(bytes) as usize
+                }
+            };
+
+            self.rx.body = vec![0u8; payload_len];
+            self.rx.body_filled = 0;
+            self.rx.phase = RecvPhase::Body;
+        }
+
+        // Phase 2 — read the payload into self.rx.body.
+        while self.rx.body_filled < self.rx.body.len() {
+            let filled = self.rx.body_filled;
+            let n = self
+                .inner
+                .read(&mut self.rx.body[filled..])
+                .await
+                .map_err(|_| TransportError::Io)?;
+            if n == 0 {
+                return Err(TransportError::Closed);
+            }
+            self.rx.body_filled += n;
+        }
+
+        // Complete: hand the body out and reset for the next frame.
+        self.rx.phase = RecvPhase::Idle;
+        let payload = core::mem::replace(&mut self.rx.body, Vec::new());
 
         let mut msg = Message::new();
         msg.push_back(&payload);

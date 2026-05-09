@@ -39,6 +39,10 @@ cargo build --no-default-features
 
 Note: there is no workspace — this is a standalone crate. Do **not** use `-p nng-core` flags.
 
+## Style
+
+Use American English spelling throughout all code, comments, and documentation: `color` not `colour`, `center` not `centre`, `-ize` not `-ise`, `serialize` not `serialise`, etc.
+
 ## Architecture
 
 Four layers, each with a single responsibility:
@@ -98,6 +102,42 @@ tokio::select! {
 **Root cause:** `wait_for_respondents(n)` accepts exactly `n` connections and then returns. Subsequent connections arrive at the OS TCP layer and sit in the kernel accept queue, but the application never calls `accept()` again, so no SP handshake runs and those connections are invisible to `survey()`.
 
 **Fix:** Added `Surveyor0::accept_pending()`, which drains the kernel accept queue in a non-blocking loop using `select! { biased; listener.accept() => ..., ready(()) => break }`. Unlike `FramedTransport::recv`, `TcpListener::accept` does not consume partial data, so cancelling it between iterations is safe. The `discovery_registry` example calls `accept_pending()` at the top of each survey loop, so nodes that join between rounds are included in the next survey.
+
+---
+
+### `Bus0::recv_any` — cancellation-unsafe poll loop
+
+**Location:** `src/transport.rs` (`FramedTransport`); `src/socket.rs`, `bus0::Bus0`; `tests/bus0.rs`
+
+**Symptom:** Under concurrent senders a garbled frame-length field would cause a panic allocating an impossibly large buffer (e.g. `memory allocation of N bytes failed` for a huge N).
+
+**Root cause:** `recv_any` polled each peer transport with the same biased-select pattern:
+```rust
+tokio::select! {
+    biased;
+    result = self.peers[i].recv() => Some(result),
+    _ = std::future::ready(()) => None,
+}
+```
+`FramedTransport::recv` issued multiple `read` calls (8 bytes for the length header, then N bytes for the payload). If `ready(())` fired before `recv` completed — which happened whenever the peer transport returned `Pending` mid-read — the future was dropped. Any bytes already consumed from the TCP stream were lost. The next `recv` call then treated mid-frame bytes as a new frame-length header, producing a garbage length.
+
+**Fix:** Made `FramedTransport::recv` itself cancellation-safe by storing partial-read state in a `RecvBuf` field on the struct (`len_buf`, `len_filled`, `body`, `body_filled`, `phase`). Dropping the future mid-read and retrying on the next poll resumes from the saved position rather than re-reading from the stream. The `recv_any` biased-select loop is now correct without any change to its structure.
+
+**Tests:** `tests/bus0.rs::framed_recv_cancellation_safe_small_buffer` (unit, reproduces via a 9-byte duplex buffer) and `tests/bus0.rs::bus0_recv_any_concurrent_senders` (end-to-end, 3 peers × 20 msgs).
+
+---
+
+### `Bus0` bounded membership — listener dropped after `listen_and_accept`
+
+**Location:** `src/socket.rs`, `bus0::Bus0`; `examples/bus_chat.rs`; `tests/bus0.rs`
+
+**Symptom:** Peers that dialled a hub after `listen_and_accept(addr, n)` returned received "connection refused" or were silently ignored and never received broadcasts.
+
+**Root cause:** The original `listen_and_accept` accepted exactly `n` connections and then dropped the `TcpListener`. Any peer that connected later hit either a closed port (connection refused) or sat in the kernel accept queue with no application-level accept() call ever draining it.
+
+**Fix:** `Bus0` now stores `listener: Option<AnyListener>` and keeps the listener alive for the entire lifetime of the struct. `accept_pending()` drains the kernel accept queue non-blockingly using `select! { biased; listener.accept() => ..., ready(()) => break }`. Callers invoke `accept_pending()` at the top of each event loop iteration to pick up peers that connected since the previous round. `TcpListener::accept` does not consume partial data, so cancelling it when `ready(())` wins is safe.
+
+**Test:** `tests/bus0.rs::bus0_dynamic_membership`.
 
 ## no_std status
 

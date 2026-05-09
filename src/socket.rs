@@ -528,9 +528,16 @@ pub mod bus0 {
     //! Every `Bus0` node can broadcast messages to all connected peers and
     //! receive from any of them.  BUS is stateless at the protocol level.
     //!
-    //! `recv_any` polls peers in round-robin with cooperative yielding; it is
-    //! suitable for demonstrations but should not be used when messages may
-    //! arrive concurrently from multiple peers at high rate.
+    //! `recv_any` polls peers in round-robin with cooperative yielding.  It is
+    //! safe to cancel between iterations because [`FramedTransport::recv`] is
+    //! cancellation-safe: any bytes already read from the stream are preserved
+    //! in the transport's internal [`RecvBuf`] and resumed on the next call.
+    //! However, `recv_any` is still unsuitable for production use at high
+    //! message rates — for that, spawn one task per peer that drives `recv` to
+    //! completion and forwards into an `mpsc` channel, as [`Pull0Fan`] does.
+    //!
+    //! [`RecvBuf`]: crate::transport::FramedTransport
+    //! [`Pull0Fan`]: super::pipeline0::Pull0Fan
 
     use std::io;
 
@@ -547,7 +554,14 @@ pub mod bus0 {
     }
 
     /// A BUS0 node that can be connected to any number of peers.
+    ///
+    /// When constructed via [`listen`](Self::listen) or
+    /// [`listen_and_accept`](Self::listen_and_accept), the OS listener socket
+    /// is kept open so that [`accept_pending`](Self::accept_pending) can admit
+    /// new peers at any time after construction.
     pub struct Bus0 {
+        /// Present when this node bound a listener; `None` for dialled nodes.
+        listener: Option<AnyListener>,
         peers: Vec<FramedTransport<AnyStream>>,
     }
 
@@ -558,6 +572,10 @@ pub mod bus0 {
         }
 
         /// Bind and accept `n` peer connections before returning.
+        ///
+        /// The listener socket is **kept open** so that
+        /// [`accept_pending`](Self::accept_pending) can admit peers that
+        /// connect after this call returns.
         pub async fn listen_and_accept(addr: &str, n: usize) -> io::Result<Self> {
             let listener: AnyListener = bind_listener(addr).await?;
             let mut peers = Vec::with_capacity(n);
@@ -568,7 +586,10 @@ pub mod bus0 {
                     Err(_) => {}
                 }
             }
-            Ok(Self { peers })
+            Ok(Self {
+                listener: Some(listener),
+                peers,
+            })
         }
 
         /// Dial one peer and return a `Bus0` with that single connection.
@@ -576,8 +597,36 @@ pub mod bus0 {
             let stream = connect_stream(addr).await?;
             let transport = connect_framed(stream, ProtocolId::BUS0).await.map_err(te)?;
             Ok(Self {
+                listener: None,
                 peers: vec![transport],
             })
+        }
+
+        /// Accept any peers whose TCP connections arrived since the last call.
+        ///
+        /// Returns immediately when the kernel accept queue is empty.  Only
+        /// has an effect on nodes created with [`listen`](Self::listen) or
+        /// [`listen_and_accept`](Self::listen_and_accept).
+        ///
+        /// `TcpListener::accept` does not consume partial data, so cancelling
+        /// it (when `ready()` wins the biased select) is safe.
+        pub async fn accept_pending(&mut self) {
+            let Some(listener) = &self.listener else {
+                return;
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    result = listener.accept() => {
+                        if let Ok(stream) = result {
+                            if let Ok(t) = connect_framed(stream, ProtocolId::BUS0).await {
+                                self.peers.push(t);
+                            }
+                        }
+                    }
+                    _ = std::future::ready(()) => break,
+                }
+            }
         }
 
         /// Broadcast `msg` to all connected peers.  Best-effort: broken
@@ -600,6 +649,12 @@ pub mod bus0 {
         /// passes.  Each iteration polls each peer non-blockingly using a
         /// `biased` select; if no peer has data immediately available the task
         /// yields before trying again.
+        ///
+        /// The `biased; ready(())` pattern here looks like a cancellation
+        /// hazard but is safe: [`FramedTransport::recv`] stores its partial-read
+        /// state in an internal [`RecvBuf`], so dropping the future mid-read and
+        /// retrying on the next pass produces exactly one complete message with
+        /// no corrupted frame boundaries.
         pub async fn recv_any(&mut self) -> io::Result<Message> {
             loop {
                 if self.peers.is_empty() {
