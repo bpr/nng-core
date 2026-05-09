@@ -1,0 +1,38 @@
+[package]
+name = "nng-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nng-core = { path = ".." }
+embedded-io-async = "0.7"
+tokio = { version = "1", features = ["rt"] }
+
+[[bin]]
+name = "codec_handshake"
+path = "fuzz_targets/codec_handshake.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "codec_frame"
+path = "fuzz_targets/codec_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "transport_recv_tcp"
+path = "fuzz_targets/transport_recv_tcp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "transport_recv_ipc"
+path = "fuzz_targets/transport_recv_ipc.rs"
+test = false
+doc = false

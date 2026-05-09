@@ -35,6 +35,14 @@ cargo run --example req_client
 
 # Verify no_std core compiles without std/alloc
 cargo build --no-default-features
+
+# Fuzz (requires nightly; targets are in fuzz/fuzz_targets/)
+cargo +nightly fuzz build                          # compile all targets
+cargo +nightly fuzz run codec_handshake            # arbitrary 8-byte handshake input
+cargo +nightly fuzz run codec_frame                # arbitrary frame bytes → decode_frame
+cargo +nightly fuzz run transport_recv_tcp         # arbitrary bytes after TCP handshake
+cargo +nightly fuzz run transport_recv_ipc         # same, IPC 9-byte frame format
+# Seed corpus lives in fuzz/corpus/<target>/.  Findings are saved to fuzz/artifacts/<target>/.
 ```
 
 Note: there is no workspace — this is a standalone crate. Do **not** use `-p nng-core` flags.

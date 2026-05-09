@@ -110,10 +110,31 @@ To verify interoperability, run any example against a native `libnng` peer, or r
 ## Running the tests
 
 ```bash
-cargo test                              # 129 tests across all suites
+cargo test                              # 132 tests across all suites
 cargo build --no-default-features       # verify no_std core compiles
 cargo test --test interop_nngcat        # NNG 1.5.x wire-compat (needs nngcat in PATH)
 ```
+
+## Fuzz testing
+
+Four [libFuzzer](https://llvm.org/docs/LibFuzzer.html) targets live in `fuzz/`. They require a nightly toolchain (`rustup toolchain install nightly`) and [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) (`cargo install cargo-fuzz`).
+
+| Target | What it exercises |
+|---|---|
+| `codec_handshake` | `decode_handshake` with arbitrary 8-byte input |
+| `codec_frame` | `decode_frame` with arbitrary byte slices |
+| `transport_recv_tcp` | `FramedTransport::recv` (TCP framing) fed arbitrary post-handshake bytes |
+| `transport_recv_ipc` | `FramedTransport::recv` (IPC framing) — focuses on the type-byte check |
+
+```bash
+cargo +nightly fuzz build                    # compile all targets
+cargo +nightly fuzz run codec_handshake      # run until Ctrl-C or a finding
+cargo +nightly fuzz run transport_recv_tcp
+```
+
+The `transport_recv_tcp` and `transport_recv_ipc` targets prepend a valid SP handshake so that `FramedTransport::connect` succeeds; the fuzz bytes are then fed as the message stream. Any panic or out-of-bounds access is reported as a finding and saved to `fuzz/artifacts/<target>/`.
+
+Seed inputs are in `fuzz/corpus/<target>/` and cover valid frames, empty frames, and (for the IPC target) a frame with a wrong type byte.
 
 ---
 

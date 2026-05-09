@@ -158,7 +158,8 @@ pub fn decode_frame(src: &[u8]) -> Result<(Message, usize), CodecError> {
         return Err(CodecError::Incomplete);
     }
     let len = u64::from_be_bytes(src[..8].try_into().unwrap()) as usize;
-    if src.len() < 8 + len {
+    // Use subtraction, not addition, to avoid overflow when len is near usize::MAX.
+    if src.len() - 8 < len {
         return Err(CodecError::Incomplete);
     }
     let mut msg = Message::new();

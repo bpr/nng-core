@@ -49,6 +49,13 @@ pub enum FrameFormat {
     Ipc,
 }
 
+/// Maximum frame payload accepted by [`FramedTransport::recv`].
+///
+/// Frames whose declared length exceeds this value are rejected with
+/// [`TransportError::FrameTooLarge`] rather than attempting an allocation
+/// that could exhaust memory or overflow address-space limits.
+pub const MAX_FRAME_BYTES: usize = 1 << 30; // 1 GiB
+
 /// Error type for transport-layer operations.
 #[derive(Debug)]
 pub enum TransportError {
@@ -63,6 +70,11 @@ pub enum TransportError {
     /// Only returned when using [`FrameFormat::Ipc`]. The inner value is the
     /// unexpected byte that was received.
     BadFrameType(u8),
+    /// The remote declared a frame larger than [`MAX_FRAME_BYTES`].
+    ///
+    /// The inner value is the declared length. Either the remote is
+    /// misbehaving or the message must be split at the application layer.
+    FrameTooLarge(usize),
 }
 
 impl core::fmt::Display for TransportError {
@@ -72,6 +84,9 @@ impl core::fmt::Display for TransportError {
             Self::Io => write!(f, "I/O error"),
             Self::Closed => write!(f, "connection closed"),
             Self::BadFrameType(t) => write!(f, "unexpected IPC frame type: {t:#04x}"),
+            Self::FrameTooLarge(n) => {
+                write!(f, "frame length {n} exceeds limit of {MAX_FRAME_BYTES}")
+            }
         }
     }
 }
@@ -253,6 +268,10 @@ where
                 }
             };
 
+            if payload_len > MAX_FRAME_BYTES {
+                self.rx.phase = RecvPhase::Idle;
+                return Err(TransportError::FrameTooLarge(payload_len));
+            }
             self.rx.body = vec![0u8; payload_len];
             self.rx.body_filled = 0;
             self.rx.phase = RecvPhase::Body;
