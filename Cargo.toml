@@ -22,4 +22,5 @@ tokio = { version = "1", optional = true, features = ["net", "sync", "rt", "io-u
 
 [dev-dependencies]
 proptest = "1"
+proptest-state-machine = "0.3"
 tokio = { version = "1", features = ["full"] }

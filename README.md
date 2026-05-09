@@ -110,10 +110,22 @@ To verify interoperability, run any example against a native `libnng` peer, or r
 ## Running the tests
 
 ```bash
-cargo test                              # 132 tests across all suites
+cargo test                              # 144 tests across all suites
 cargo build --no-default-features       # verify no_std core compiles
 cargo test --test interop_nngcat        # NNG 1.5.x wire-compat (needs nngcat in PATH)
 ```
+
+## Property-based tests
+
+Three [proptest](https://github.com/proptest-rs/proptest) suites run as part of `cargo test` and exercise the codec and protocol state machines with arbitrary inputs.
+
+| Test file | What it covers |
+|---|---|
+| `tests/proptest_codec.rs` | `encode_frame` + `decode_frame` round-trip; `encode_handshake` + `decode_handshake` round-trip; oversized length fields return `Incomplete` (regression for a fuzzing find) |
+| `tests/proptest_reqrep0.rs` | REQ/REP round-trip for any body; wire ID always has the high backtrace-chain bit set; wrong ID always rejected; ID counters are unique and never zero across up to 199 consecutive calls; same ID-sequence properties for `Surveyor0State` |
+| `tests/proptest_sub0.rs` | `Sub0State` modelled as a [proptest-state-machine](https://github.com/proptest-rs/proptest/tree/main/proptest-state-machine) against a `BTreeSet` reference — arbitrary sequences of `subscribe` / `unsubscribe` / `matches` must agree with the reference on every `matches` call and on `is_empty()` |
+
+The state-machine test (`proptest_sub0`) is the most thorough: it generates sequences of up to 20 operations, biasing toward unsubscribing existing topics to exercise deduplication and the empty-subscriptions path.
 
 ## Fuzz testing
 
