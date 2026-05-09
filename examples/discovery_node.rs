@@ -35,7 +35,10 @@ async fn main() {
                     println!("[{name}] replied: {reply_text}");
                 }
             }
-            Err(e) => { println!("[{name}] registry closed: {e}"); break; }
+            Err(e) => {
+                println!("[{name}] registry closed: {e}");
+                break;
+            }
         }
     }
 }

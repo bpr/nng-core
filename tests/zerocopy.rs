@@ -4,7 +4,7 @@ use nng_core::{
         pair::{Pair1State, PairError},
         pubsub::Sub0State,
         reqrep::{Rep0State, Req0State, ReqRepError},
-        survey::{Respondent0State, Surveyor0State, SurveyError},
+        survey::{Respondent0State, SurveyError, Surveyor0State},
     },
 };
 
@@ -135,7 +135,13 @@ fn req_id_mismatch_zerocopy() {
     msg.push_back(&42u32.to_be_bytes());
     msg.push_back(b"data");
     let err = req.process_incoming(&mut msg, 1).unwrap_err();
-    assert!(matches!(err, ReqRepError::IdMismatch { got: 42, expected: 1 }));
+    assert!(matches!(
+        err,
+        ReqRepError::IdMismatch {
+            got: 42,
+            expected: 1
+        }
+    ));
 }
 
 #[test]
@@ -143,7 +149,10 @@ fn req_message_too_short_zerocopy() {
     let req = Req0State::new();
     let mut msg = ZeroCopyMessage::<64>::new();
     msg.push_back(&[0x00, 0x01]);
-    assert_eq!(req.process_incoming(&mut msg, 1), Err(ReqRepError::MessageTooShort));
+    assert_eq!(
+        req.process_incoming(&mut msg, 1),
+        Err(ReqRepError::MessageTooShort)
+    );
 }
 
 #[test]

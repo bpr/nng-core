@@ -3,7 +3,7 @@ use nng_core::protocols::{
     pair::{Pair1State, PairError},
     pubsub::{Pub0State, Sub0State},
     reqrep::{Rep0State, Req0State, ReqRepError},
-    survey::{Respondent0State, Surveyor0State, SurveyError},
+    survey::{Respondent0State, SurveyError, Surveyor0State},
 };
 
 // ── REQ0 / REP0 ──
@@ -54,7 +54,13 @@ fn req_id_mismatch() {
     msg.push_back(&42u32.to_be_bytes()); // wrong ID
     msg.push_back(b"data");
     let err = req.process_incoming(&mut msg, 1).unwrap_err();
-    assert!(matches!(err, ReqRepError::IdMismatch { got: 42, expected: 1 }));
+    assert!(matches!(
+        err,
+        ReqRepError::IdMismatch {
+            got: 42,
+            expected: 1
+        }
+    ));
 }
 
 #[test]
@@ -62,7 +68,10 @@ fn req_message_too_short() {
     let req = Req0State::new();
     let mut msg = Message::new();
     msg.push_back(&[0x00, 0x01]); // only 2 bytes
-    assert_eq!(req.process_incoming(&mut msg, 1), Err(ReqRepError::MessageTooShort));
+    assert_eq!(
+        req.process_incoming(&mut msg, 1),
+        Err(ReqRepError::MessageTooShort)
+    );
 }
 
 #[test]
@@ -84,7 +93,10 @@ fn rep_message_too_short() {
     let rep = Rep0State::new();
     let mut msg = Message::new();
     msg.push_back(&[0x00]); // only 1 byte
-    assert_eq!(rep.process_incoming(&mut msg), Err(ReqRepError::MessageTooShort));
+    assert_eq!(
+        rep.process_incoming(&mut msg),
+        Err(ReqRepError::MessageTooShort)
+    );
 }
 
 // ── PUB0 / SUB0 ──

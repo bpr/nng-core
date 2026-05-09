@@ -49,15 +49,15 @@ pub struct ProtocolId(pub u16);
 impl ProtocolId {
     pub const PAIR0: Self = Self(0x10); // NNI_PROTO(1,0)
     pub const PAIR1: Self = Self(0x11); // NNI_PROTO(1,1)
-    pub const PUB0: Self = Self(0x20);  // NNI_PROTO(2,0)
-    pub const SUB0: Self = Self(0x21);  // NNI_PROTO(2,1)
-    pub const REQ0: Self = Self(0x30);  // NNI_PROTO(3,0)
-    pub const REP0: Self = Self(0x31);  // NNI_PROTO(3,1)
+    pub const PUB0: Self = Self(0x20); // NNI_PROTO(2,0)
+    pub const SUB0: Self = Self(0x21); // NNI_PROTO(2,1)
+    pub const REQ0: Self = Self(0x30); // NNI_PROTO(3,0)
+    pub const REP0: Self = Self(0x31); // NNI_PROTO(3,1)
     pub const PUSH0: Self = Self(0x50); // NNI_PROTO(5,0)
     pub const PULL0: Self = Self(0x51); // NNI_PROTO(5,1)
-    pub const SURVEYOR0: Self = Self(0x62);   // NNI_PROTO(6,2)
+    pub const SURVEYOR0: Self = Self(0x62); // NNI_PROTO(6,2)
     pub const RESPONDENT0: Self = Self(0x63); // NNI_PROTO(6,3)
-    pub const BUS0: Self = Self(0x70);  // NNI_PROTO(7,0)
+    pub const BUS0: Self = Self(0x70); // NNI_PROTO(7,0)
 
     /// Return the protocol ID that the remote peer must present.
     ///

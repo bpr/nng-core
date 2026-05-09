@@ -18,10 +18,7 @@ const BASE_PORT: u16 = 12000;
 
 #[tokio::main]
 async fn main() {
-    let index: u16 = env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let index: u16 = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let addr = format!("tcp://127.0.0.1:{}", BASE_PORT + index);
 
     let mut rep = Rep0::listen(&addr).await.expect("listen failed");
@@ -30,7 +27,10 @@ async fn main() {
     loop {
         let (req, responder) = match rep.receive().await {
             Ok(r) => r,
-            Err(e) => { println!("[worker-{index}] done: {e}"); break; }
+            Err(e) => {
+                println!("[worker-{index}] done: {e}");
+                break;
+            }
         };
 
         let text = String::from_utf8_lossy(req.body()).into_owned();

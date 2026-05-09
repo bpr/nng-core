@@ -6,8 +6,9 @@ use nng_core::{
 
 #[tokio::test]
 async fn loopback_req_rep_handshake_and_messages() {
-    let (mut req, mut rep) =
-        inproc_pair(ProtocolId::REQ0, ProtocolId::REP0).await.unwrap();
+    let (mut req, mut rep) = inproc_pair(ProtocolId::REQ0, ProtocolId::REP0)
+        .await
+        .unwrap();
 
     for i in 0u32..5 {
         // REQ sends
@@ -32,8 +33,9 @@ async fn loopback_req_rep_handshake_and_messages() {
 
 #[tokio::test]
 async fn loopback_message_with_header() {
-    let (mut a, mut b) =
-        inproc_pair(ProtocolId::PAIR0, ProtocolId::PAIR0).await.unwrap();
+    let (mut a, mut b) = inproc_pair(ProtocolId::PAIR0, ProtocolId::PAIR0)
+        .await
+        .unwrap();
 
     // Message with both header and body — on the wire they arrive as one body.
     let mut msg = Message::new();
@@ -43,13 +45,17 @@ async fn loopback_message_with_header() {
 
     let received = b.recv().await.unwrap();
     // Wire puts header before body, all lands in received body.
-    assert_eq!(received.body(), &[0xDE, 0xAD, b'p', b'a', b'y', b'l', b'o', b'a', b'd']);
+    assert_eq!(
+        received.body(),
+        &[0xDE, 0xAD, b'p', b'a', b'y', b'l', b'o', b'a', b'd']
+    );
 }
 
 #[tokio::test]
 async fn loopback_empty_message() {
-    let (mut a, mut b) =
-        inproc_pair(ProtocolId::PUSH0, ProtocolId::PULL0).await.unwrap();
+    let (mut a, mut b) = inproc_pair(ProtocolId::PUSH0, ProtocolId::PULL0)
+        .await
+        .unwrap();
 
     a.send(&Message::new()).await.unwrap();
     let received = b.recv().await.unwrap();

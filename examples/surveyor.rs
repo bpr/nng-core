@@ -14,9 +14,14 @@ const ADDR: &str = "tcp://127.0.0.1:10003";
 
 #[tokio::main]
 async fn main() {
-    let mut surveyor = survey0::Surveyor0::listen(ADDR).await.expect("listen failed");
+    let mut surveyor = survey0::Surveyor0::listen(ADDR)
+        .await
+        .expect("listen failed");
     println!("Surveyor listening on {ADDR}, waiting for respondents...");
-    surveyor.wait_for_respondents(1).await.expect("accept failed");
+    surveyor
+        .wait_for_respondents(1)
+        .await
+        .expect("accept failed");
     println!("Respondent connected. Sending survey...");
 
     let mut q = Message::new();

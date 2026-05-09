@@ -1,6 +1,8 @@
 use nng_core::{
     Message,
-    codec::{CodecError, ProtocolId, decode_frame, decode_handshake, encode_frame, encode_handshake},
+    codec::{
+        CodecError, ProtocolId, decode_frame, decode_handshake, encode_frame, encode_handshake,
+    },
 };
 use proptest::prelude::*;
 

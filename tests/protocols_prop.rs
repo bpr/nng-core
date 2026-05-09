@@ -3,7 +3,7 @@ use nng_core::{
     protocols::{
         pubsub::Sub0State,
         reqrep::{Rep0State, Req0State, ReqRepError},
-        survey::{Respondent0State, Surveyor0State, SurveyError},
+        survey::{Respondent0State, SurveyError, Surveyor0State},
     },
 };
 use proptest::prelude::*;

@@ -4,8 +4,11 @@
 //! Each test uses a unique socket path / port to avoid collisions when the
 //! suite runs in parallel.
 
+use nng_core::{
+    Message,
+    socket::{pipeline0, pubsub0, reqrep0},
+};
 use std::time::Duration;
-use nng_core::{Message, socket::{pipeline0, pubsub0, reqrep0}};
 
 fn nngcat_available() -> bool {
     std::process::Command::new("nngcat")
@@ -83,9 +86,7 @@ async fn req_nngcat_to_rep_rust_ipc() {
     let url = "ipc:///tmp/nng_core_req_c_rep_rust.ipc";
 
     let url_owned = url.to_string();
-    let listen_task = tokio::spawn(async move {
-        reqrep0::Rep0::listen(&url_owned).await
-    });
+    let listen_task = tokio::spawn(async move { reqrep0::Rep0::listen(&url_owned).await });
 
     // Wait for bind to complete before nngcat dials.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -96,10 +97,15 @@ async fn req_nngcat_to_rep_rust_ipc() {
         .expect("failed to spawn nngcat");
 
     let mut rep = tokio::time::timeout(Duration::from_secs(2), listen_task)
-        .await.expect("listen timed out").unwrap().unwrap();
+        .await
+        .expect("listen timed out")
+        .unwrap()
+        .unwrap();
 
     let (msg, responder) = tokio::time::timeout(Duration::from_secs(2), rep.receive())
-        .await.expect("receive timed out").unwrap();
+        .await
+        .expect("receive timed out")
+        .unwrap();
     assert_eq!(msg.body(), b"ping");
 
     let mut reply = Message::new();
@@ -116,9 +122,7 @@ async fn req_nngcat_to_rep_rust_tcp() {
     let url = "tcp://127.0.0.1:15581";
 
     let url_owned = url.to_string();
-    let listen_task = tokio::spawn(async move {
-        reqrep0::Rep0::listen(&url_owned).await
-    });
+    let listen_task = tokio::spawn(async move { reqrep0::Rep0::listen(&url_owned).await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -128,10 +132,15 @@ async fn req_nngcat_to_rep_rust_tcp() {
         .expect("failed to spawn nngcat");
 
     let mut rep = tokio::time::timeout(Duration::from_secs(2), listen_task)
-        .await.expect("listen timed out").unwrap().unwrap();
+        .await
+        .expect("listen timed out")
+        .unwrap()
+        .unwrap();
 
     let (msg, responder) = tokio::time::timeout(Duration::from_secs(2), rep.receive())
-        .await.expect("receive timed out").unwrap();
+        .await
+        .expect("receive timed out")
+        .unwrap();
     assert_eq!(msg.body(), b"ping");
 
     let mut reply = Message::new();
@@ -173,9 +182,7 @@ async fn push_nngcat_to_pull_rust_ipc() {
     let url = "ipc:///tmp/nng_core_push_c_pull_rust.ipc";
 
     let url_owned = url.to_string();
-    let listen_task = tokio::spawn(async move {
-        pipeline0::Pull0::listen(&url_owned).await
-    });
+    let listen_task = tokio::spawn(async move { pipeline0::Pull0::listen(&url_owned).await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -185,10 +192,15 @@ async fn push_nngcat_to_pull_rust_ipc() {
         .expect("failed to spawn nngcat");
 
     let mut pull = tokio::time::timeout(Duration::from_secs(2), listen_task)
-        .await.expect("listen timed out").unwrap().unwrap();
+        .await
+        .expect("listen timed out")
+        .unwrap()
+        .unwrap();
 
     let msg = tokio::time::timeout(Duration::from_secs(2), pull.pull())
-        .await.expect("pull timed out").unwrap();
+        .await
+        .expect("pull timed out")
+        .unwrap();
 
     assert_eq!(msg.body(), b"hello from nngcat");
 

@@ -29,7 +29,10 @@ async fn main() {
                 let text = String::from_utf8_lossy(msg.body()).into_owned();
                 println!("[sub/{topic}] {text}");
             }
-            Err(e) => { println!("[sub/{topic}] done: {e}"); break; }
+            Err(e) => {
+                println!("[sub/{topic}] done: {e}");
+                break;
+            }
         }
     }
 }

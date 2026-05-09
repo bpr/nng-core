@@ -31,8 +31,8 @@
 //! match is silently discarded with [`SurveyError::StaleSurveyId`]. This
 //! handles network re-ordering, slow respondents, and spurious retransmissions.
 
-use crate::message::MessageBuf;
 use crate::codec::ProtocolId;
+use crate::message::MessageBuf;
 
 pub const PROTOCOL_ID_SURVEYOR: ProtocolId = ProtocolId::SURVEYOR0;
 pub const PROTOCOL_ID_RESPONDENT: ProtocolId = ProtocolId::RESPONDENT0;
@@ -76,7 +76,10 @@ pub struct Surveyor0State {
 
 impl Surveyor0State {
     pub fn new() -> Self {
-        Self { next_id: 1, current_id: 0 }
+        Self {
+            next_id: 1,
+            current_id: 0,
+        }
     }
 
     /// Assign a survey ID to an outgoing survey message and return that ID.
@@ -104,7 +107,10 @@ impl Surveyor0State {
         let id = u32::from_be_bytes(msg.body()[..4].try_into().unwrap());
         msg.trim_front(4);
         if id != self.current_id {
-            return Err(SurveyError::StaleSurveyId { got: id, expected: self.current_id });
+            return Err(SurveyError::StaleSurveyId {
+                got: id,
+                expected: self.current_id,
+            });
         }
         Ok(())
     }
@@ -147,7 +153,10 @@ impl Respondent0State {
     ///
     /// Returns the [`SurveyRoutingInfo`] needed to send a response. On success
     /// `msg.body()` holds only the survey payload.
-    pub fn process_incoming<M: MessageBuf>(&self, msg: &mut M) -> Result<SurveyRoutingInfo, SurveyError> {
+    pub fn process_incoming<M: MessageBuf>(
+        &self,
+        msg: &mut M,
+    ) -> Result<SurveyRoutingInfo, SurveyError> {
         if msg.body().len() < 4 {
             return Err(SurveyError::MessageTooShort);
         }

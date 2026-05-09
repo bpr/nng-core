@@ -329,7 +329,10 @@ impl<const N: usize> MessageBuf for ZeroCopyMessage<N> {
 
     fn header_push_back(&mut self, data: &[u8]) {
         let new_end = self.h_end + data.len();
-        assert!(new_end <= Self::HEADER_CAP, "ZeroCopyMessage header overflow");
+        assert!(
+            new_end <= Self::HEADER_CAP,
+            "ZeroCopyMessage header overflow"
+        );
         self.buf[self.h_end..new_end].copy_from_slice(data);
         self.h_end = new_end;
     }
@@ -339,7 +342,10 @@ impl<const N: usize> MessageBuf for ZeroCopyMessage<N> {
     /// This is O(1): no bytes are moved or zeroed. The vacated bytes become
     /// "trimmed" dead space that is never read again.
     fn trim_front(&mut self, n: usize) {
-        assert!(self.b_start + n <= self.b_end, "ZeroCopyMessage trim_front out of bounds");
+        assert!(
+            self.b_start + n <= self.b_end,
+            "ZeroCopyMessage trim_front out of bounds"
+        );
         self.b_start += n;
     }
 }

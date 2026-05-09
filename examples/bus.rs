@@ -40,7 +40,9 @@ async fn main() {
     });
 
     // Hub: accept 2 spokes, broadcast, then collect one message from each.
-    let mut hub = bus0::Bus0::listen_and_accept(ADDR, 2).await.expect("listen failed");
+    let mut hub = bus0::Bus0::listen_and_accept(ADDR, 2)
+        .await
+        .expect("listen failed");
     println!("[hub] 2 spokes connected");
 
     let mut announcement = Message::new();
@@ -51,7 +53,11 @@ async fn main() {
     // Receive one message from each spoke (order may vary).
     for i in 0..2 {
         let msg = hub.recv_any().await.expect("recv failed");
-        println!("[hub] response {}: {}", i + 1, String::from_utf8_lossy(msg.body()));
+        println!(
+            "[hub] response {}: {}",
+            i + 1,
+            String::from_utf8_lossy(msg.body())
+        );
     }
 
     spoke1.await.unwrap();

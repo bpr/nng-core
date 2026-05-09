@@ -11,7 +11,10 @@
 //!   cargo run --example wq_broker
 //!   cargo run --example wq_client
 
-use nng_core::{Message, socket::reqrep0::{Rep0, Req0}};
+use nng_core::{
+    Message,
+    socket::reqrep0::{Rep0, Req0},
+};
 
 const CLIENT_ADDR: &str = "tcp://127.0.0.1:11005";
 const WORKER_BASE_PORT: u16 = 12000;
@@ -36,7 +39,10 @@ async fn main() {
     loop {
         let (client_req, responder) = match frontend.receive().await {
             Ok(r) => r,
-            Err(e) => { println!("[broker] done: {e}"); break; }
+            Err(e) => {
+                println!("[broker] done: {e}");
+                break;
+            }
         };
 
         let text = String::from_utf8_lossy(client_req.body()).into_owned();

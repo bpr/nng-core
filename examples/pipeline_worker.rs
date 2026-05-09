@@ -12,8 +12,8 @@
 //!   cargo run --example pipeline_worker -- beta
 //!   cargo run --example pipeline_worker -- gamma
 
-use nng_core::socket::pipeline0::{Pull0, Push0};
 use nng_core::Message;
+use nng_core::socket::pipeline0::{Pull0, Push0};
 use std::{env, time::Duration};
 
 const VENTILATOR_ADDR: &str = "tcp://127.0.0.1:11000";
@@ -28,13 +28,18 @@ async fn main() {
     let mut sink = Push0::dial(SINK_ADDR).await.expect("sink dial failed");
     println!("[{name}] connected to sink at {SINK_ADDR}");
 
-    let mut source = Pull0::dial(VENTILATOR_ADDR).await.expect("ventilator dial failed");
+    let mut source = Pull0::dial(VENTILATOR_ADDR)
+        .await
+        .expect("ventilator dial failed");
     println!("[{name}] connected to ventilator at {VENTILATOR_ADDR}");
 
     loop {
         let msg = match source.pull().await {
             Ok(m) => m,
-            Err(e) => { println!("[{name}] ventilator closed: {e}"); break; }
+            Err(e) => {
+                println!("[{name}] ventilator closed: {e}");
+                break;
+            }
         };
 
         let text = String::from_utf8_lossy(msg.body()).into_owned();

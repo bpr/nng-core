@@ -37,8 +37,8 @@
 //!
 //! [`FramedTransport`]: crate::transport::FramedTransport
 
-use crate::message::MessageBuf;
 use crate::codec::ProtocolId;
+use crate::message::MessageBuf;
 
 pub const PROTOCOL_ID_REQ: ProtocolId = ProtocolId::REQ0;
 pub const PROTOCOL_ID_REP: ProtocolId = ProtocolId::REP0;
@@ -61,7 +61,10 @@ impl core::fmt::Display for ReqRepError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::IdMismatch { got, expected } => {
-                write!(f, "req/rep ID mismatch: got {got:#010x}, expected {expected:#010x}")
+                write!(
+                    f,
+                    "req/rep ID mismatch: got {got:#010x}, expected {expected:#010x}"
+                )
             }
             Self::MessageTooShort => write!(f, "message too short to contain request ID"),
         }
@@ -108,7 +111,11 @@ impl Req0State {
     /// Reads the first 4 bytes of `msg.body()` as a big-endian u32, strips the
     /// high bit (backtrace marker), and compares with `sent_id`. On success
     /// the 4 bytes are consumed and `msg.body()` holds only the reply payload.
-    pub fn process_incoming<M: MessageBuf>(&self, msg: &mut M, sent_id: u32) -> Result<(), ReqRepError> {
+    pub fn process_incoming<M: MessageBuf>(
+        &self,
+        msg: &mut M,
+        sent_id: u32,
+    ) -> Result<(), ReqRepError> {
         if msg.body().len() < 4 {
             return Err(ReqRepError::MessageTooShort);
         }
@@ -116,7 +123,10 @@ impl Req0State {
         msg.trim_front(4);
         let id = wire_id & 0x7fff_ffffu32; // strip the end-of-backtrace flag
         if id != sent_id {
-            return Err(ReqRepError::IdMismatch { got: id, expected: sent_id });
+            return Err(ReqRepError::IdMismatch {
+                got: id,
+                expected: sent_id,
+            });
         }
         Ok(())
     }

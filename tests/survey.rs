@@ -30,7 +30,10 @@ async fn survey_single_respondent() {
 
     let mut question = Message::new();
     question.push_back(b"ping");
-    let responses = surveyor.survey(question, Duration::from_secs(1)).await.unwrap();
+    let responses = surveyor
+        .survey(question, Duration::from_secs(1))
+        .await
+        .unwrap();
 
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].body(), b"pong");
@@ -60,8 +63,10 @@ async fn survey_multiple_respondents() {
 
     let mut question = Message::new();
     question.push_back(b"query");
-    let mut responses =
-        surveyor.survey(question, Duration::from_secs(1)).await.unwrap();
+    let mut responses = surveyor
+        .survey(question, Duration::from_secs(1))
+        .await
+        .unwrap();
 
     assert_eq!(responses.len(), 3);
 

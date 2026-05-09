@@ -12,6 +12,9 @@ Default branch: **`master`** (not `main`)
 ## Commands
 
 ```bash
+# Format (always run before committing; cargo fmt must produce no changes)
+cargo fmt
+
 # Build
 cargo build
 

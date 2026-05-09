@@ -37,7 +37,10 @@ async fn main() {
                     reply.push_back(reply_text.as_bytes());
                     pair.send(reply).await.expect("send failed");
                 }
-                Err(e) => { println!("[A] done: {e}"); break; }
+                Err(e) => {
+                    println!("[A] done: {e}");
+                    break;
+                }
             }
         }
     } else {

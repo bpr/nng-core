@@ -29,8 +29,8 @@
 //! [`Sub0State::matches`] only needs to read `msg.body()` — it never calls
 //! `trim_front` or `header_push_back`.
 
-use crate::message::MessageBuf;
 use crate::codec::ProtocolId;
+use crate::message::MessageBuf;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;

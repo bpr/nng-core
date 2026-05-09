@@ -23,9 +23,9 @@ use crate::{
 };
 
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
-#[cfg(unix)]
 use crate::transport::ipc::TokioUnixStream;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 
 fn transport_error_to_io(e: TransportError) -> io::Error {
     io::Error::other(e.to_string())
@@ -148,7 +148,9 @@ fn bind_ipc_listener(path: &str) -> io::Result<AnyListener> {
 
 #[cfg(not(unix))]
 fn bind_ipc_listener(_path: &str) -> io::Result<AnyListener> {
-    Err(io::Error::other("IPC (Unix domain sockets) is not supported on this platform"))
+    Err(io::Error::other(
+        "IPC (Unix domain sockets) is not supported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -160,7 +162,9 @@ async fn connect_ipc_stream(path: &str) -> io::Result<AnyStream> {
 
 #[cfg(not(unix))]
 async fn connect_ipc_stream(_path: &str) -> io::Result<AnyStream> {
-    Err(io::Error::other("IPC (Unix domain sockets) is not supported on this platform"))
+    Err(io::Error::other(
+        "IPC (Unix domain sockets) is not supported on this platform",
+    ))
 }
 
 // ── Socket<P> ──
@@ -173,7 +177,10 @@ pub struct Socket<P> {
 
 impl<P> Socket<P> {
     fn new(transport: FramedTransport<AnyStream>) -> Self {
-        Self { transport, _protocol: core::marker::PhantomData }
+        Self {
+            transport,
+            _protocol: core::marker::PhantomData,
+        }
     }
 
     /// Bind and wait for the first incoming connection, then perform the SP
@@ -197,7 +204,10 @@ impl<P> Socket<P> {
     }
 
     pub async fn send_raw(&mut self, msg: &Message) -> io::Result<()> {
-        self.transport.send(msg).await.map_err(transport_error_to_io)
+        self.transport
+            .send(msg)
+            .await
+            .map_err(transport_error_to_io)
     }
 
     pub async fn recv_raw(&mut self) -> io::Result<Message> {
@@ -240,7 +250,10 @@ pub mod pubsub0 {
         /// Bind to `addr` and start accepting subscriber connections.
         pub async fn listen(addr: &str) -> io::Result<Self> {
             let listener = bind_listener(addr).await?;
-            Ok(Self { listener, subscribers: Vec::new() })
+            Ok(Self {
+                listener,
+                subscribers: Vec::new(),
+            })
         }
 
         /// Block until at least `n` subscribers have completed the SP handshake.
@@ -307,7 +320,10 @@ pub mod pubsub0 {
         pub async fn dial(addr: &str) -> io::Result<Self> {
             let stream = connect_stream(addr).await?;
             let transport = connect_framed(stream, ProtocolId::SUB0).await.map_err(te)?;
-            Ok(Self { transport, state: Sub0State::new() })
+            Ok(Self {
+                transport,
+                state: Sub0State::new(),
+            })
         }
 
         /// Subscribe to messages whose body starts with `prefix`.
@@ -350,7 +366,7 @@ pub mod survey0 {
     use crate::{
         Message,
         codec::ProtocolId,
-        protocols::survey::{Respondent0State, Surveyor0State, SurveyRoutingInfo},
+        protocols::survey::{Respondent0State, SurveyRoutingInfo, Surveyor0State},
         transport::{FramedTransport, TransportError},
     };
 
@@ -371,7 +387,11 @@ pub mod survey0 {
         /// Bind and start accepting respondent connections.
         pub async fn listen(addr: &str) -> io::Result<Self> {
             let listener = bind_listener(addr).await?;
-            Ok(Self { listener, respondents: Vec::new(), state: Surveyor0State::new() })
+            Ok(Self {
+                listener,
+                respondents: Vec::new(),
+                state: Surveyor0State::new(),
+            })
         }
 
         /// Block until at least `n` respondents have connected.
@@ -411,7 +431,11 @@ pub mod survey0 {
         ///
         /// Responses are collected from each respondent sequentially; the
         /// remaining timeout budget is shared across all of them.
-        pub async fn survey(&mut self, msg: Message, timeout: Duration) -> io::Result<Vec<Message>> {
+        pub async fn survey(
+            &mut self,
+            msg: Message,
+            timeout: Duration,
+        ) -> io::Result<Vec<Message>> {
             let mut outgoing = msg;
             self.state.prepare_survey(&mut outgoing);
 
@@ -470,8 +494,13 @@ pub mod survey0 {
         /// Connect to a surveyor at `addr`.
         pub async fn dial(addr: &str) -> io::Result<Self> {
             let stream = connect_stream(addr).await?;
-            let transport = connect_framed(stream, ProtocolId::RESPONDENT0).await.map_err(te)?;
-            Ok(Self { transport, state: Respondent0State::new() })
+            let transport = connect_framed(stream, ProtocolId::RESPONDENT0)
+                .await
+                .map_err(te)?;
+            Ok(Self {
+                transport,
+                state: Respondent0State::new(),
+            })
         }
 
         /// Receive the next survey.  Returns the application message and a
@@ -482,7 +511,13 @@ pub mod survey0 {
                 .state
                 .process_incoming(&mut msg)
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            Ok((msg, SurveyHandle { transport: &mut self.transport, routing }))
+            Ok((
+                msg,
+                SurveyHandle {
+                    transport: &mut self.transport,
+                    routing,
+                },
+            ))
         }
     }
 }
@@ -540,7 +575,9 @@ pub mod bus0 {
         pub async fn dial(addr: &str) -> io::Result<Self> {
             let stream = connect_stream(addr).await?;
             let transport = connect_framed(stream, ProtocolId::BUS0).await.map_err(te)?;
-            Ok(Self { peers: vec![transport] })
+            Ok(Self {
+                peers: vec![transport],
+            })
         }
 
         /// Broadcast `msg` to all connected peers.  Best-effort: broken
@@ -726,7 +763,11 @@ pub mod pipeline0 {
                     tokio::spawn(async move {
                         loop {
                             match transport.recv().await {
-                                Ok(msg) => { if tx2.send(Ok(msg)).await.is_err() { break; } }
+                                Ok(msg) => {
+                                    if tx2.send(Ok(msg)).await.is_err() {
+                                        break;
+                                    }
+                                }
                                 Err(e) => {
                                     let _ = tx2.send(Err(te(e))).await;
                                     break;
@@ -768,12 +809,7 @@ pub mod pair0 {
 
     use std::io;
 
-    use crate::{
-        Message,
-        codec::ProtocolId,
-        protocols::pair::Pair0State,
-        socket::Socket,
-    };
+    use crate::{Message, codec::ProtocolId, protocols::pair::Pair0State, socket::Socket};
 
     /// Pair socket: bidirectional point-to-point messaging.
     pub struct Pair0(Socket<Pair0State>);
@@ -860,19 +896,27 @@ pub mod reqrep0 {
 
     impl Rep0 {
         pub async fn listen(addr: &str) -> io::Result<Self> {
-            Socket::listen(addr, ProtocolId::REP0)
-                .await
-                .map(|s| Self { inner: s, state: Rep0State::new() })
+            Socket::listen(addr, ProtocolId::REP0).await.map(|s| Self {
+                inner: s,
+                state: Rep0State::new(),
+            })
         }
 
         /// Receive the next request.  Returns the application message plus a
         /// `Responder` that must be used to send the reply.
         pub async fn receive(&mut self) -> io::Result<(Message, Responder<'_>)> {
             let mut msg = self.inner.recv_raw().await?;
-            let routing = self.state
+            let routing = self
+                .state
                 .process_incoming(&mut msg)
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            Ok((msg, Responder { socket: &mut self.inner, routing }))
+            Ok((
+                msg,
+                Responder {
+                    socket: &mut self.inner,
+                    routing,
+                },
+            ))
         }
     }
 }

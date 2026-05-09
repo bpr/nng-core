@@ -20,13 +20,19 @@ async fn main() {
         println!("[worker] listening on {ADDR}");
         let mut rep = match Rep0::listen(ADDR).await {
             Ok(r) => r,
-            Err(e) => { eprintln!("[worker] bind failed: {e}"); break; }
+            Err(e) => {
+                eprintln!("[worker] bind failed: {e}");
+                break;
+            }
         };
 
         loop {
             let (req, responder) = match rep.receive().await {
                 Ok(r) => r,
-                Err(e) => { println!("[worker] connection closed: {e}"); break; }
+                Err(e) => {
+                    println!("[worker] connection closed: {e}");
+                    break;
+                }
             };
 
             served += 1;

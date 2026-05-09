@@ -30,9 +30,7 @@ use embedded_io_async::{Read, Write};
 
 use crate::{
     Message,
-    codec::{
-        CodecError, ProtocolId, check_peer, decode_handshake, encode_handshake,
-    },
+    codec::{CodecError, ProtocolId, check_peer, decode_handshake, encode_handshake},
 };
 
 /// Wire framing variant — controls how the per-message length header is encoded.
@@ -115,7 +113,11 @@ where
     /// Sends the local protocol's 8-byte header, then reads and validates the
     /// remote header. Returns `Err` if the remote's protocol is incompatible
     /// or if I/O fails during the handshake.
-    pub async fn connect(mut inner: T, local: ProtocolId, format: FrameFormat) -> Result<Self, TransportError> {
+    pub async fn connect(
+        mut inner: T,
+        local: ProtocolId,
+        format: FrameFormat,
+    ) -> Result<Self, TransportError> {
         let tx = encode_handshake(local);
         write_all(&mut inner, &tx).await?;
 
@@ -269,10 +271,7 @@ pub mod loopback {
     pub async fn inproc_pair(
         local: ProtocolId,
         peer: ProtocolId,
-    ) -> Result<
-        (FramedTransport<TokioDuplex>, FramedTransport<TokioDuplex>),
-        TransportError,
-    > {
+    ) -> Result<(FramedTransport<TokioDuplex>, FramedTransport<TokioDuplex>), TransportError> {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (t1, t2) = tokio::try_join!(
             FramedTransport::connect(TokioDuplex(a), local, FrameFormat::Tcp),

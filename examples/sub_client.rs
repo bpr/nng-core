@@ -20,7 +20,10 @@ async fn main() {
     loop {
         match sub.next().await {
             Ok(msg) => println!("Received: {}", String::from_utf8_lossy(msg.body())),
-            Err(e) => { println!("Done: {e}"); break; }
+            Err(e) => {
+                println!("Done: {e}");
+                break;
+            }
         }
     }
 }

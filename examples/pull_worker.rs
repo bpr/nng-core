@@ -18,7 +18,10 @@ async fn main() {
     loop {
         match pull.pull().await {
             Ok(msg) => println!("Worker processed: {}", String::from_utf8_lossy(msg.body())),
-            Err(e) => { println!("Done: {e}"); break; }
+            Err(e) => {
+                println!("Done: {e}");
+                break;
+            }
         }
     }
 }

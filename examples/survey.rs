@@ -35,7 +35,9 @@ async fn main() {
     });
 
     // Surveyor: wait for both then broadcast "status?".
-    let mut surveyor = survey0::Surveyor0::listen(ADDR).await.expect("listen failed");
+    let mut surveyor = survey0::Surveyor0::listen(ADDR)
+        .await
+        .expect("listen failed");
     println!("[surveyor] listening on {ADDR}");
     surveyor.wait_for_respondents(2).await.expect("wait failed");
     println!("[surveyor] 2 respondents connected");

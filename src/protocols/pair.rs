@@ -25,8 +25,8 @@
 //! The NNG default TTL is 8, which allows up to 8 device hops before a message
 //! is dropped. Valid values are 1–15.
 
-use crate::message::MessageBuf;
 use crate::codec::ProtocolId;
+use crate::message::MessageBuf;
 
 pub const PROTOCOL_ID_PAIR0: ProtocolId = ProtocolId::PAIR0;
 pub const PROTOCOL_ID_PAIR1: ProtocolId = ProtocolId::PAIR1;

@@ -137,10 +137,7 @@ fn frame_incomplete_payload() {
     msg.push_back(b"hello world");
     let encoded = encode_frame(&msg);
     // Give only partial payload
-    assert_eq!(
-        decode_frame(&encoded[..10]),
-        Err(CodecError::Incomplete)
-    );
+    assert_eq!(decode_frame(&encoded[..10]), Err(CodecError::Incomplete));
 }
 
 #[test]
