@@ -185,6 +185,70 @@ pub enum CodecError {
     Incomplete,
 }
 
+// ── Kani proof harnesses ──────────────────────────────────────────────────────
+
+#[cfg(kani)]
+mod kani_proofs {
+    //! Kani proof harnesses for the SP codec.
+    //!
+    //! Each `#[kani::proof]` function is a bounded model-checking harness.
+    //! `kani::any::<T>()` produces a symbolic value that stands for *every*
+    //! possible value of type `T` simultaneously; the solver explores all
+    //! paths through the code for all such inputs and reports any path that
+    //! reaches a panic, assertion failure, or memory-safety violation.
+    //! `kani::assume(cond)` constrains the symbolic inputs (equivalent to a
+    //! precondition).
+    //!
+    //! `#[kani::unwind(N)]` sets the loop-unroll bound.  N must be at least
+    //! `max_iterations + 1`; each harness documents which constant drives N.
+
+    use super::*;
+
+    /// decode_handshake must never panic on any 8-byte input — only Ok or Err.
+    #[kani::proof]
+    fn decode_handshake_never_panics() {
+        let bytes: [u8; 8] = kani::any();
+        let _ = decode_handshake(&bytes);
+    }
+
+    /// encode_handshake always produces bytes that decode_handshake accepts,
+    /// and the decoded ProtocolId equals the original.
+    #[kani::proof]
+    fn encode_decode_handshake_roundtrip() {
+        let proto = ProtocolId(kani::any::<u16>());
+        let wire = encode_handshake(proto);
+        // encode_handshake always emits valid magic and zero reserved bytes,
+        // so decode must always succeed.
+        let decoded = decode_handshake(&wire).unwrap();
+        assert_eq!(decoded, proto);
+    }
+
+    /// decode_frame must never panic on any input up to 16 bytes.
+    /// Unwind bound 17 = MAX (16) + 1, covering the byte-copy loop inside
+    /// push_back when the full 8-byte payload (16 − 8 header bytes) is copied.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn decode_frame_never_panics() {
+        const MAX: usize = 16;
+        let data: [u8; MAX] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX);
+        let _ = decode_frame(&data[..len]);
+    }
+
+    /// Fuzz regression: any non-zero declared length with no payload bytes must
+    /// return Incomplete, proving the integer-overflow fix is correct for all
+    /// possible u64 length values including usize::MAX.
+    #[kani::proof]
+    fn decode_frame_oversized_length_is_incomplete() {
+        let len_val: u64 = kani::any();
+        kani::assume(len_val > 0);
+        let src = len_val.to_be_bytes(); // 8-byte header only, no payload
+        let result = decode_frame(&src);
+        assert!(matches!(result, Err(CodecError::Incomplete)));
+    }
+}
+
 impl core::fmt::Display for CodecError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

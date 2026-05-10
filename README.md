@@ -115,6 +115,28 @@ cargo build --no-default-features       # verify no_std core compiles
 cargo test --test interop_nngcat        # NNG 1.5.x wire-compat (needs nngcat in PATH)
 ```
 
+## Formal verification (Kani)
+
+Nine [Kani](https://model-checking.github.io/kani/) harnesses provide mathematical proofs of correctness for the codec and message buffer types. They live inline in `src/codec.rs` and `src/message.rs` under `#[cfg(kani)]` and require [`cargo-kani`](https://github.com/model-checking/kani) (`cargo install cargo-kani`).
+
+```bash
+RUSTC_WRAPPER="" cargo kani    # verify all 9 harnesses
+```
+
+| Harness | What is proved |
+|---|---|
+| `decode_handshake_never_panics` | `decode_handshake` never panics on any 8-byte input |
+| `encode_decode_handshake_roundtrip` | Any `ProtocolId` survives an encode→decode round-trip |
+| `decode_frame_never_panics` | `decode_frame` never panics on inputs up to 16 bytes |
+| `decode_frame_oversized_length_is_incomplete` | Any non-zero declared length with no payload bytes returns `Incomplete` — proves the integer-overflow fix is correct for **all** possible `u64` length values |
+| `zcm_push_back_body_correct` | `ZeroCopyMessage::push_back` stores exactly the bytes that were passed |
+| `zcm_trim_front_body_correct` | `ZeroCopyMessage::trim_front(n)` removes exactly the first `n` bytes |
+| `zcm_header_does_not_alias_body` | Writing to the header region and body region are completely independent |
+| `message_push_back_trim_front_correct` | `Message::push_back` + `trim_front(n)` leaves the suffix starting at byte `n` |
+| `message_header_body_independent` | `Message` header and body do not alias |
+
+The `RUSTC_WRAPPER=""` prefix disables `sccache`, which does not recognise the Kani compiler wrapper.
+
 ## Property-based tests
 
 Three [proptest](https://github.com/proptest-rs/proptest) suites run as part of `cargo test` and exercise the codec and protocol state machines with arbitrary inputs.

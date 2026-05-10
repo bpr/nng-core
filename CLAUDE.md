@@ -36,6 +36,9 @@ cargo run --example req_client
 # Verify no_std core compiles without std/alloc
 cargo build --no-default-features
 
+# Formal verification with Kani (harnesses are in src/codec.rs and src/message.rs)
+RUSTC_WRAPPER="" cargo kani                        # verify all 9 harnesses
+
 # Fuzz (requires nightly; targets are in fuzz/fuzz_targets/)
 cargo +nightly fuzz build                          # compile all targets
 cargo +nightly fuzz run codec_handshake            # arbitrary 8-byte handshake input

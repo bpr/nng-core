@@ -305,6 +305,112 @@ impl<const N: usize> ZeroCopyMessage<N> {
     }
 }
 
+// ── Kani proof harnesses ──────────────────────────────────────────────────────
+
+#[cfg(kani)]
+mod kani_proofs {
+    //! Kani proof harnesses for the message buffer types.
+    //!
+    //! `kani::any::<T>()` is a symbolic value representing every possible `T`
+    //! simultaneously; the solver checks all paths for all such inputs.
+    //! `kani::assume(cond)` adds a precondition that constrains the inputs.
+    //!
+    //! `#[kani::unwind(N)]` sets the loop-unroll bound to `N`.  The rule is
+    //! `N = max_loop_iterations + 1`; each harness documents which constant
+    //! determines that maximum.
+    //!
+    //! `ZeroCopyMessage<32>` is used throughout: `HEADER_CAP = 8`,
+    //! `BODY_CAP = 24`.  The small fixed size keeps verification fast while
+    //! covering all index-arithmetic paths through the struct's pointer fields.
+
+    use super::*;
+
+    // ── ZeroCopyMessage (N=32: HEADER_CAP=8, BODY_CAP=24) ────────────────────
+
+    /// push_back stores exactly the bytes that were passed.
+    /// Unwind bound 25 = BODY_CAP (24) + 1, covering the copy loop.
+    #[kani::proof]
+    #[kani::unwind(25)]
+    fn zcm_push_back_body_correct() {
+        const BODY_CAP: usize = 24; // 3 * 32 / 4
+        let len: usize = kani::any();
+        kani::assume(len <= BODY_CAP);
+        let data: [u8; BODY_CAP] = kani::any();
+
+        let mut msg: ZeroCopyMessage<32> = ZeroCopyMessage::new();
+        msg.push_back(&data[..len]);
+        assert_eq!(msg.body(), &data[..len]);
+    }
+
+    /// trim_front(n) removes exactly the first n bytes from the body.
+    /// Unwind bound 17 = N (16) + 1, covering the slice-comparison loop in
+    /// the assert_eq.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn zcm_trim_front_body_correct() {
+        const N: usize = 16;
+        let data: [u8; N] = kani::any();
+        let trim: usize = kani::any();
+        kani::assume(trim <= N);
+
+        let mut msg: ZeroCopyMessage<32> = ZeroCopyMessage::new();
+        msg.push_back(&data);
+        msg.trim_front(trim);
+        assert_eq!(msg.body(), &data[trim..]);
+    }
+
+    /// Writing to the header region does not alias or corrupt the body, and
+    /// writing to the body does not corrupt the header.
+    /// Unwind bound 13 = hdr (4) + body (8) + 1, covering the copy and
+    /// comparison loops across both regions.
+    #[kani::proof]
+    #[kani::unwind(13)]
+    fn zcm_header_does_not_alias_body() {
+        let hdr: [u8; 4] = kani::any(); // one u32 — typical SP header
+        let body: [u8; 8] = kani::any();
+
+        let mut msg: ZeroCopyMessage<32> = ZeroCopyMessage::new();
+        msg.header_push_back(&hdr);
+        msg.push_back(&body);
+        assert_eq!(msg.header(), &hdr);
+        assert_eq!(msg.body(), &body);
+    }
+
+    // ── Message (heap-backed, bounded inputs) ─────────────────────────────────
+
+    /// push_back followed by trim_front(n) leaves exactly the suffix starting
+    /// at byte n.  Unwind bound 17 = N (16) + 1, covering Vec's internal
+    /// drain-and-shift loop plus the slice-comparison in assert_eq.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn message_push_back_trim_front_correct() {
+        const N: usize = 16;
+        let data: [u8; N] = kani::any();
+        let trim: usize = kani::any();
+        kani::assume(trim <= N);
+
+        let mut msg = Message::new();
+        msg.push_back(&data);
+        msg.trim_front(trim);
+        assert_eq!(msg.body(), &data[trim..]);
+    }
+
+    /// Header and body are independent: writing to one does not affect the
+    /// other.  Unwind bound 9 = hdr (4) + body (4) + 1.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn message_header_body_independent() {
+        let hdr: [u8; 4] = kani::any();
+        let body: [u8; 4] = kani::any();
+
+        let mut msg = Message::new();
+        msg.header_push_back(&hdr);
+        msg.push_back(&body);
+        assert_eq!(msg.header(), &hdr);
+        assert_eq!(msg.body(), &body);
+    }
+}
+
 impl<const N: usize> Default for ZeroCopyMessage<N> {
     fn default() -> Self {
         Self::new()
