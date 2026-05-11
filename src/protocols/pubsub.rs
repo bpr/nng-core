@@ -29,11 +29,17 @@
 //! [`Sub0State::matches`] only needs to read `msg.body()` — it never calls
 //! `trim_front` or `header_push_back`.
 
+use core::ops::Bound;
+
 use crate::codec::ProtocolId;
 use crate::message::MessageBuf;
 
 #[cfg(not(feature = "std"))]
+use alloc::collections::BTreeSet;
+#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use std::collections::BTreeSet;
 
 pub const PROTOCOL_ID_PUB: ProtocolId = ProtocolId::PUB0;
 pub const PROTOCOL_ID_SUB: ProtocolId = ProtocolId::SUB0;
@@ -58,38 +64,46 @@ impl Default for Pub0State {
 
 /// State machine for the SUB0 (subscriber) side.
 ///
-/// Maintains a de-duplicated list of topic prefixes. A message passes the
+/// Maintains a de-duplicated set of topic prefixes. A message passes the
 /// filter if *any* prefix is a byte-prefix of the message body.
 ///
-/// Requires `alloc` (for the subscription list). The individual `matches`
+/// Subscriptions are stored in a `BTreeSet<Vec<u8>>`. This gives O(log N)
+/// insert and remove, and lets [`matches`](Self::matches) use a range query
+/// (`..=body`) to skip every subscription that sorts above the message body —
+/// those entries can never be a byte-prefix of it.
+///
+/// Requires `alloc` (for the subscription set). The individual `matches`
 /// check is `no_alloc`-compatible via the [`MessageBuf`] bound.
 pub struct Sub0State {
-    subscriptions: Vec<Vec<u8>>,
+    subscriptions: BTreeSet<Vec<u8>>,
 }
 
 impl Sub0State {
     pub fn new() -> Self {
         Self {
-            subscriptions: Vec::new(),
+            subscriptions: BTreeSet::new(),
         }
     }
 
     /// Register a topic prefix. An empty prefix (`b""`) matches all messages.
     ///
-    /// Duplicate prefixes are silently ignored so that a single call to
-    /// [`unsubscribe`](Self::unsubscribe) is always sufficient to remove the topic.
+    /// Duplicate prefixes are silently ignored: `BTreeSet::insert` is a no-op
+    /// when the key is already present, so a single call to
+    /// [`unsubscribe`](Self::unsubscribe) is always sufficient to remove a topic.
     pub fn subscribe(&mut self, prefix: &[u8]) {
-        if !self.subscriptions.iter().any(|s| s == prefix) {
-            self.subscriptions.push(prefix.to_vec());
-        }
+        self.subscriptions.insert(prefix.to_vec());
     }
 
     /// Remove a previously registered topic prefix. No-op if not subscribed.
     pub fn unsubscribe(&mut self, prefix: &[u8]) {
-        self.subscriptions.retain(|s| s.as_slice() != prefix);
+        self.subscriptions.remove(prefix);
     }
 
     /// Return `true` if `msg.body()` starts with at least one registered prefix.
+    ///
+    /// Uses `range(..=body)` to skip subscriptions that sort above the message
+    /// body — any such subscription cannot be a byte-prefix of body. Only the
+    /// remaining (smaller) entries are checked with `starts_with`.
     ///
     /// Generic over [`MessageBuf`] so this check works for both heap-backed
     /// [`Message`](crate::Message) and stack-allocated
@@ -97,8 +111,8 @@ impl Sub0State {
     pub fn matches<M: MessageBuf>(&self, msg: &M) -> bool {
         let body = msg.body();
         self.subscriptions
-            .iter()
-            .any(|prefix| body.starts_with(prefix))
+            .range::<[u8], _>((Bound::Unbounded, Bound::Included(body)))
+            .any(|prefix: &Vec<u8>| body.starts_with(prefix.as_slice()))
     }
 
     /// Return `true` if there are no active subscriptions.
