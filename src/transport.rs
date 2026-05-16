@@ -396,3 +396,7 @@ pub mod loopback {
         Ok((t1, t2))
     }
 }
+#[cfg(feature = "ws")]
+pub mod ws;
+#[cfg(feature = "ws")]
+pub use ws::{WsError, WsTransport};

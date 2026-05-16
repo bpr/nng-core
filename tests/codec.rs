@@ -158,3 +158,23 @@ fn frame_multiple_frames_in_buffer() {
 
     assert_eq!(c1 + c2, buf.len());
 }
+
+#[test]
+#[cfg(feature = "ws")]
+fn ws_subprotocol_values() {
+    use crate::codec::ProtocolId;
+    assert_eq!(
+        ProtocolId::REQ0.expected_peer().ws_subprotocol(),
+        "rep.sp.nanomsg.org"
+    );
+    assert_eq!(ProtocolId::REP0.ws_subprotocol(), "rep.sp.nanomsg.org");
+    assert_eq!(ProtocolId::PUB0.ws_subprotocol(), "pub.sp.nanomsg.org");
+    assert_eq!(
+        ProtocolId::SUB0.expected_peer().ws_subprotocol(),
+        "sub.sp.nanomsg.org"
+    );
+    assert_eq!(
+        ProtocolId::SURVEYOR0.expected_peer().ws_subprotocol(),
+        "respondent.sp.nanomsg.org"
+    );
+}

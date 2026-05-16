@@ -80,6 +80,39 @@ impl ProtocolId {
             _ => self, // unknown protocol — skip peer check
         }
     }
+
+    /// Short name used in the `Sec-WebSocket-Protocol` header.
+    ///
+    /// This is the lowercase ASCII name NNG assigns to each protocol in its
+    /// `proto_self` / `proto_peer` descriptors (e.g. `"req"`, `"rep"`).
+    pub fn ws_protocol_name(self) -> &'static str {
+        match self {
+            Self::REQ0 => "req",
+            Self::REP0 => "rep",
+            Self::PUB0 => "pub",
+            Self::SUB0 => "sub",
+            Self::PUSH0 => "push",
+            Self::PULL0 => "pull",
+            Self::PAIR0 | Self::PAIR1 => "pair",
+            Self::SURVEYOR0 => "surveyor",
+            Self::RESPONDENT0 => "respondent",
+            Self::BUS0 => "bus",
+            _ => "unknown",
+        }
+    }
+
+    /// Full `Sec-WebSocket-Protocol` header value for this protocol.
+    ///
+    /// Both the dialer and the listener use the *listener's* protocol name:
+    /// - Listener sets: `self.ws_subprotocol()`
+    /// - Dialer   sets: `self.expected_peer().ws_subprotocol()`
+    ///
+    /// Example: a REQ dialer calls `ProtocolId::REQ0.expected_peer().ws_subprotocol()`
+    /// which yields `"rep.sp.nanomsg.org"`, matching what the REP listener expects.
+    #[cfg(feature = "ws")]
+    pub fn ws_subprotocol(self) -> String {
+        format!("{}.sp.nanomsg.org", self.ws_protocol_name())
+    }
 }
 
 // ── Handshake ─────────────────────────────────────────────────────────────────

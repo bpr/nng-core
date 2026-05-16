@@ -1,14 +1,11 @@
 //! High-level socket API for nng-core (requires `std` / tokio).
 //!
-//! Supported URL schemes: `tcp://host:port` and (Unix only) `ipc:///path`.
+//! Supported URL schemes: `tcp://host:port`, `ipc:///path` (Unix only),
+//! and `ws://host:port[/path]` (requires the `ws` Cargo feature).
 //!
-//! Each socket type is generic over a protocol marker and wraps a
-//! `FramedTransport`.  Listeners can accept multiple connections; for
-//! simplicity, `Socket::listen` accepts exactly **one** connection before
-//! returning (sufficient for examples and most tests).
-//!
-//! For multi-client servers, call `Socket::accept_one` in a loop and spawn
-//! a task for each connection.
+//! Each socket type wraps an [`AnyTransport`], which dispatches to either
+//! [`FramedTransport`] (TCP / IPC) or [`WsTransport`] (WebSocket) depending
+//! on the URL scheme used at construction time.
 
 use std::io;
 
@@ -27,21 +24,45 @@ use crate::transport::ipc::TokioUnixStream;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
-fn transport_error_to_io(e: TransportError) -> io::Error {
+#[cfg(feature = "ws")]
+use crate::transport::ws::{WsError, WsTransport};
+
+// ── AnyTransport: FramedTransport or WsTransport ─────────────────────────────
+
+pub(crate) enum AnyTransport {
+    Framed(FramedTransport<AnyStream>),
+    #[cfg(feature = "ws")]
+    Ws(WsTransport),
+}
+
+impl AnyTransport {
+    pub(crate) async fn send(&mut self, msg: &Message) -> io::Result<()> {
+        match self {
+            Self::Framed(t) => t.send(msg).await.map_err(te_to_io),
+            #[cfg(feature = "ws")]
+            Self::Ws(t) => t.send(msg).await.map_err(ws_to_io),
+        }
+    }
+
+    pub(crate) async fn recv(&mut self) -> io::Result<Message> {
+        match self {
+            Self::Framed(t) => t.recv().await.map_err(te_to_io),
+            #[cfg(feature = "ws")]
+            Self::Ws(t) => t.recv().await.map_err(ws_to_io),
+        }
+    }
+}
+
+fn te_to_io(e: TransportError) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Perform the SP handshake on `stream`, selecting the frame format from the
-/// stream's transport type (TCP → 8-byte header, IPC → 9-byte NNG 1.5.x header).
-pub(crate) async fn connect_framed(
-    stream: AnyStream,
-    proto: ProtocolId,
-) -> Result<FramedTransport<AnyStream>, TransportError> {
-    let format = stream.frame_format();
-    FramedTransport::connect(stream, proto, format).await
+#[cfg(feature = "ws")]
+fn ws_to_io(e: WsError) -> io::Error {
+    io::Error::other(e.to_string())
 }
 
-// ── AnyStream: TCP or IPC behind a single trait impl ──
+// ── AnyStream: TCP or IPC behind a single trait impl ─────────────────────────
 
 pub(crate) enum AnyStream {
     Tcp(TokioTcpStream),
@@ -91,37 +112,115 @@ impl AnyStream {
     }
 }
 
-// ── AnyListener: TCP or IPC, with a unified accept() ──
+// ── AnyListener: TCP, IPC, or WebSocket ──────────────────────────────────────
 
 pub(crate) enum AnyListener {
     Tcp(TcpListener),
     #[cfg(unix)]
     Ipc(UnixListener),
+    #[cfg(feature = "ws")]
+    Ws(TcpListener),
 }
 
 impl AnyListener {
-    pub(crate) async fn accept(&self) -> io::Result<AnyStream> {
+    /// Accept one connection and complete the SP handshake (TCP/IPC) or
+    /// WebSocket upgrade (ws://), returning a ready-to-use `AnyTransport`.
+    pub(crate) async fn accept_as_transport(&self, proto: ProtocolId) -> io::Result<AnyTransport> {
         match self {
             Self::Tcp(l) => {
                 let (stream, _) = l.accept().await?;
-                Ok(AnyStream::Tcp(TokioTcpStream(stream)))
+                connect_framed(AnyStream::Tcp(TokioTcpStream(stream)), proto)
+                    .await
+                    .map(AnyTransport::Framed)
+                    .map_err(te_to_io)
             }
             #[cfg(unix)]
             Self::Ipc(l) => {
                 let (stream, _) = l.accept().await?;
-                Ok(AnyStream::Ipc(TokioUnixStream(stream)))
+                connect_framed(AnyStream::Ipc(TokioUnixStream(stream)), proto)
+                    .await
+                    .map(AnyTransport::Framed)
+                    .map_err(te_to_io)
+            }
+            #[cfg(feature = "ws")]
+            Self::Ws(l) => {
+                let (tcp, _) = l.accept().await?;
+                WsTransport::accept(tcp, proto)
+                    .await
+                    .map(AnyTransport::Ws)
+                    .map_err(ws_to_io)
+            }
+        }
+    }
+
+    /// Accept one raw OS-level connection without performing any protocol
+    /// handshake.  Used in `biased`-select drain loops where only the kernel
+    /// accept (which returns `Pending` when the queue is empty) belongs inside
+    /// the select; the handshake must run outside so it cannot be cancelled.
+    pub(crate) async fn accept_raw(&self) -> io::Result<RawConn> {
+        match self {
+            Self::Tcp(l) => {
+                let (stream, _) = l.accept().await?;
+                Ok(RawConn::Stream(AnyStream::Tcp(TokioTcpStream(stream))))
+            }
+            #[cfg(unix)]
+            Self::Ipc(l) => {
+                let (stream, _) = l.accept().await?;
+                Ok(RawConn::Stream(AnyStream::Ipc(TokioUnixStream(stream))))
+            }
+            #[cfg(feature = "ws")]
+            Self::Ws(l) => {
+                let (tcp, _) = l.accept().await?;
+                Ok(RawConn::Ws(tcp))
             }
         }
     }
 }
 
-// ── URL dispatch helpers ──
+/// A raw accepted connection before any protocol handshake or WS upgrade.
+pub(crate) enum RawConn {
+    Stream(AnyStream),
+    #[cfg(feature = "ws")]
+    Ws(TcpStream),
+}
+
+impl RawConn {
+    /// Complete the protocol handshake or WebSocket upgrade and return a
+    /// ready-to-use transport.
+    pub(crate) async fn into_transport(self, proto: ProtocolId) -> io::Result<AnyTransport> {
+        match self {
+            Self::Stream(s) => connect_framed(s, proto)
+                .await
+                .map(AnyTransport::Framed)
+                .map_err(te_to_io),
+            #[cfg(feature = "ws")]
+            Self::Ws(tcp) => WsTransport::accept(tcp, proto)
+                .await
+                .map(AnyTransport::Ws)
+                .map_err(ws_to_io),
+        }
+    }
+}
+
+// ── URL dispatch helpers ──────────────────────────────────────────────────────
 
 pub(crate) async fn bind_listener(addr: &str) -> io::Result<AnyListener> {
     if let Some(tcp_addr) = addr.strip_prefix("tcp://") {
         TcpListener::bind(tcp_addr).await.map(AnyListener::Tcp)
     } else if let Some(ipc_path) = addr.strip_prefix("ipc://") {
         bind_ipc_listener(ipc_path)
+    } else if let Some(ws_addr) = addr.strip_prefix("ws://") {
+        #[cfg(feature = "ws")]
+        {
+            // Bind to host:port only; ignore any path component in the URL.
+            let host_port = ws_addr.split('/').next().unwrap_or(ws_addr);
+            return TcpListener::bind(host_port).await.map(AnyListener::Ws);
+        }
+        #[cfg(not(feature = "ws"))]
+        {
+            let _ = ws_addr;
+            return Err(io::Error::other("ws:// requires the `ws` Cargo feature"));
+        }
     } else {
         Err(io::Error::other(format!("unsupported URL scheme: {addr}")))
     }
@@ -139,9 +238,35 @@ pub(crate) async fn connect_stream(addr: &str) -> io::Result<AnyStream> {
     }
 }
 
+/// Dial a URL and return a ready `AnyTransport`.
+///
+/// Handles `ws://` via [`WsTransport::connect`]; all other schemes go through
+/// [`connect_stream`] + [`connect_framed`].
+pub(crate) async fn connect_transport(addr: &str, proto: ProtocolId) -> io::Result<AnyTransport> {
+    #[cfg(feature = "ws")]
+    if addr.starts_with("ws://") {
+        return WsTransport::connect(addr, proto)
+            .await
+            .map(AnyTransport::Ws)
+            .map_err(ws_to_io);
+    }
+    let stream = connect_stream(addr).await?;
+    connect_framed(stream, proto)
+        .await
+        .map(AnyTransport::Framed)
+        .map_err(te_to_io)
+}
+
+pub(crate) async fn connect_framed(
+    stream: AnyStream,
+    proto: ProtocolId,
+) -> Result<FramedTransport<AnyStream>, TransportError> {
+    let format = stream.frame_format();
+    FramedTransport::connect(stream, proto, format).await
+}
+
 #[cfg(unix)]
 fn bind_ipc_listener(path: &str) -> io::Result<AnyListener> {
-    // Remove a stale socket file left by a prior crash, matching libnng behaviour.
     let _ = std::fs::remove_file(path);
     UnixListener::bind(path).map(AnyListener::Ipc)
 }
@@ -167,55 +292,46 @@ async fn connect_ipc_stream(_path: &str) -> io::Result<AnyStream> {
     ))
 }
 
-// ── Socket<P> ──
+// ── Socket<P> ────────────────────────────────────────────────────────────────
 
-/// A connected socket wrapping a single `FramedTransport`.
+/// A connected socket wrapping a single transport (TCP, IPC, or WebSocket).
 pub struct Socket<P> {
-    transport: FramedTransport<AnyStream>,
+    transport: AnyTransport,
     _protocol: core::marker::PhantomData<P>,
 }
 
 impl<P> Socket<P> {
-    fn new(transport: FramedTransport<AnyStream>) -> Self {
+    fn new(transport: AnyTransport) -> Self {
         Self {
             transport,
             _protocol: core::marker::PhantomData,
         }
     }
 
-    /// Bind and wait for the first incoming connection, then perform the SP
+    /// Bind and wait for the first incoming connection, then complete the
     /// handshake.  The listener is dropped after accepting one connection.
     pub async fn listen(addr: &str, proto: ProtocolId) -> io::Result<Self> {
         let listener = bind_listener(addr).await?;
-        let stream = listener.accept().await?;
-        let transport = connect_framed(stream, proto)
-            .await
-            .map_err(transport_error_to_io)?;
+        let transport = listener.accept_as_transport(proto).await?;
         Ok(Self::new(transport))
     }
 
-    /// Connect to `addr` and perform the SP handshake.
+    /// Connect to `addr` and complete the handshake.
     pub async fn dial(addr: &str, proto: ProtocolId) -> io::Result<Self> {
-        let stream = connect_stream(addr).await?;
-        let transport = connect_framed(stream, proto)
-            .await
-            .map_err(transport_error_to_io)?;
+        let transport = connect_transport(addr, proto).await?;
         Ok(Self::new(transport))
     }
 
     pub async fn send_raw(&mut self, msg: &Message) -> io::Result<()> {
-        self.transport
-            .send(msg)
-            .await
-            .map_err(transport_error_to_io)
+        self.transport.send(msg).await
     }
 
     pub async fn recv_raw(&mut self) -> io::Result<Message> {
-        self.transport.recv().await.map_err(transport_error_to_io)
+        self.transport.recv().await
     }
 }
 
-// ── Protocol marker types ──
+// ── Protocol modules ──────────────────────────────────────────────────────────
 
 pub mod pubsub0 {
     //! PUB0 / SUB0 socket API.
@@ -227,23 +343,14 @@ pub mod pubsub0 {
 
     use std::io;
 
-    use crate::{
-        Message,
-        codec::ProtocolId,
-        protocols::pubsub::Sub0State,
-        transport::{FramedTransport, TransportError},
-    };
+    use crate::{Message, codec::ProtocolId, protocols::pubsub::Sub0State};
 
-    use super::{AnyListener, AnyStream, bind_listener, connect_framed, connect_stream};
-
-    fn te(e: TransportError) -> io::Error {
-        io::Error::other(e.to_string())
-    }
+    use super::{AnyListener, AnyTransport, bind_listener, connect_transport};
 
     /// Publish socket: listens for subscriber connections, fans out messages.
     pub struct Pub0 {
         listener: AnyListener,
-        subscribers: Vec<FramedTransport<AnyStream>>,
+        subscribers: Vec<AnyTransport>,
     }
 
     impl Pub0 {
@@ -256,31 +363,32 @@ pub mod pubsub0 {
             })
         }
 
-        /// Block until at least `n` subscribers have completed the SP handshake.
+        /// Block until at least `n` subscribers have completed the handshake.
         pub async fn wait_for_subscribers(&mut self, n: usize) -> io::Result<()> {
             while self.subscribers.len() < n {
-                let stream = self.listener.accept().await?;
-                match connect_framed(stream, ProtocolId::PUB0).await {
-                    Ok(t) => self.subscribers.push(t),
-                    Err(_) => {}
+                if let Ok(t) = self.listener.accept_as_transport(ProtocolId::PUB0).await {
+                    self.subscribers.push(t);
                 }
             }
             Ok(())
         }
 
-        /// Accept any connections that are already waiting without blocking.
         async fn drain_incoming(&mut self) {
             loop {
-                tokio::select! {
+                // Only the raw OS accept belongs in the biased select: it
+                // returns Pending immediately when the queue is empty, which
+                // is the signal to stop.  The handshake runs outside so it
+                // cannot be dropped mid-flight.
+                let raw = tokio::select! {
                     biased;
-                    stream = self.listener.accept() => {
-                        if let Ok(stream) = stream {
-                            if let Ok(t) = connect_framed(stream, ProtocolId::PUB0).await {
-                                self.subscribers.push(t);
-                            }
-                        }
-                    }
+                    result = self.listener.accept_raw() => match result {
+                        Ok(raw) => raw,
+                        Err(_) => break,
+                    },
                     _ = std::future::ready(()) => break,
+                };
+                if let Ok(t) = raw.into_transport(ProtocolId::PUB0).await {
+                    self.subscribers.push(t);
                 }
             }
         }
@@ -311,15 +419,14 @@ pub mod pubsub0 {
 
     /// Subscribe socket: connects to a publisher, filters by topic prefix.
     pub struct Sub0 {
-        transport: FramedTransport<AnyStream>,
+        transport: AnyTransport,
         state: Sub0State,
     }
 
     impl Sub0 {
         /// Connect to the publisher at `addr`.
         pub async fn dial(addr: &str) -> io::Result<Self> {
-            let stream = connect_stream(addr).await?;
-            let transport = connect_framed(stream, ProtocolId::SUB0).await.map_err(te)?;
+            let transport = connect_transport(addr, ProtocolId::SUB0).await?;
             Ok(Self {
                 transport,
                 state: Sub0State::new(),
@@ -341,11 +448,10 @@ pub mod pubsub0 {
 
         /// Return the next message that matches any active subscription.
         ///
-        /// Non-matching messages are silently discarded.  Blocks until a
-        /// matching message arrives or the connection is closed.
+        /// Non-matching messages are silently discarded.
         pub async fn next(&mut self) -> io::Result<Message> {
             loop {
-                let msg = self.transport.recv().await.map_err(te)?;
+                let msg = self.transport.recv().await?;
                 if self.state.matches(&msg) {
                     return Ok(msg);
                 }
@@ -367,19 +473,14 @@ pub mod survey0 {
         Message,
         codec::ProtocolId,
         protocols::survey::{Respondent0State, SurveyRoutingInfo, Surveyor0State},
-        transport::{FramedTransport, TransportError},
     };
 
-    use super::{AnyListener, AnyStream, bind_listener, connect_framed, connect_stream};
-
-    fn te(e: TransportError) -> io::Error {
-        io::Error::other(e.to_string())
-    }
+    use super::{AnyListener, AnyTransport, bind_listener, connect_transport};
 
     /// Surveyor socket: broadcasts surveys to multiple respondents.
     pub struct Surveyor0 {
         listener: AnyListener,
-        respondents: Vec<FramedTransport<AnyStream>>,
+        respondents: Vec<AnyTransport>,
         state: Surveyor0State,
     }
 
@@ -397,10 +498,12 @@ pub mod survey0 {
         /// Block until at least `n` respondents have connected.
         pub async fn wait_for_respondents(&mut self, n: usize) -> io::Result<()> {
             while self.respondents.len() < n {
-                let stream = self.listener.accept().await?;
-                match connect_framed(stream, ProtocolId::SURVEYOR0).await {
-                    Ok(t) => self.respondents.push(t),
-                    Err(_) => {}
+                if let Ok(t) = self
+                    .listener
+                    .accept_as_transport(ProtocolId::SURVEYOR0)
+                    .await
+                {
+                    self.respondents.push(t);
                 }
             }
             Ok(())
@@ -409,28 +512,24 @@ pub mod survey0 {
         /// Accept any respondents that connected since the last call.
         ///
         /// Returns immediately when the kernel's accept queue is empty.
-        /// Safe to cancel: `TcpListener::accept` does not consume partial data.
         pub async fn accept_pending(&mut self) {
             loop {
-                tokio::select! {
+                let raw = tokio::select! {
                     biased;
-                    result = self.listener.accept() => {
-                        if let Ok(stream) = result {
-                            if let Ok(t) = connect_framed(stream, ProtocolId::SURVEYOR0).await {
-                                self.respondents.push(t);
-                            }
-                        }
-                    }
+                    result = self.listener.accept_raw() => match result {
+                        Ok(raw) => raw,
+                        Err(_) => break,
+                    },
                     _ = std::future::ready(()) => break,
+                };
+                if let Ok(t) = raw.into_transport(ProtocolId::SURVEYOR0).await {
+                    self.respondents.push(t);
                 }
             }
         }
 
         /// Broadcast `msg` as a survey; collect all responses arriving within
         /// `timeout`.  Returns the set of application-level response bodies.
-        ///
-        /// Responses are collected from each respondent sequentially; the
-        /// remaining timeout budget is shared across all of them.
         pub async fn survey(
             &mut self,
             msg: Message,
@@ -470,7 +569,7 @@ pub mod survey0 {
 
     /// One-shot handle that allows sending a single response to the active survey.
     pub struct SurveyHandle<'a> {
-        transport: &'a mut FramedTransport<AnyStream>,
+        transport: &'a mut AnyTransport,
         routing: SurveyRoutingInfo,
     }
 
@@ -480,23 +579,20 @@ pub mod survey0 {
             let state = Respondent0State::new();
             let mut outgoing = msg;
             state.prepare_response(&mut outgoing, &self.routing);
-            self.transport.send(&outgoing).await.map_err(te)
+            self.transport.send(&outgoing).await
         }
     }
 
     /// Respondent socket: dials a surveyor, receives surveys, sends responses.
     pub struct Respondent0 {
-        transport: FramedTransport<AnyStream>,
+        transport: AnyTransport,
         state: Respondent0State,
     }
 
     impl Respondent0 {
         /// Connect to a surveyor at `addr`.
         pub async fn dial(addr: &str) -> io::Result<Self> {
-            let stream = connect_stream(addr).await?;
-            let transport = connect_framed(stream, ProtocolId::RESPONDENT0)
-                .await
-                .map_err(te)?;
+            let transport = connect_transport(addr, ProtocolId::RESPONDENT0).await?;
             Ok(Self {
                 transport,
                 state: Respondent0State::new(),
@@ -506,7 +602,7 @@ pub mod survey0 {
         /// Receive the next survey.  Returns the application message and a
         /// `SurveyHandle` that must be used to respond (or dropped to skip).
         pub async fn receive(&mut self) -> io::Result<(Message, SurveyHandle<'_>)> {
-            let mut msg = self.transport.recv().await.map_err(te)?;
+            let mut msg = self.transport.recv().await?;
             let routing = self
                 .state
                 .process_incoming(&mut msg)
@@ -532,26 +628,17 @@ pub mod bus0 {
     //! safe to cancel between iterations because [`FramedTransport::recv`] is
     //! cancellation-safe: any bytes already read from the stream are preserved
     //! in the transport's internal [`RecvBuf`] and resumed on the next call.
-    //! However, `recv_any` is still unsuitable for production use at high
-    //! message rates — for that, spawn one task per peer that drives `recv` to
-    //! completion and forwards into an `mpsc` channel, as [`Pull0Fan`] does.
+    //! For WebSocket peers, `WsTransport::recv` is also cancellation-safe
+    //! because tungstenite reassembles frames internally before yielding.
     //!
     //! [`RecvBuf`]: crate::transport::FramedTransport
     //! [`Pull0Fan`]: super::pipeline0::Pull0Fan
 
     use std::io;
 
-    use crate::{
-        Message,
-        codec::ProtocolId,
-        transport::{FramedTransport, TransportError},
-    };
+    use crate::{Message, codec::ProtocolId};
 
-    use super::{AnyListener, AnyStream, bind_listener, connect_framed, connect_stream};
-
-    fn te(e: TransportError) -> io::Error {
-        io::Error::other(e.to_string())
-    }
+    use super::{AnyListener, AnyTransport, bind_listener, connect_transport};
 
     /// A BUS0 node that can be connected to any number of peers.
     ///
@@ -562,7 +649,7 @@ pub mod bus0 {
     pub struct Bus0 {
         /// Present when this node bound a listener; `None` for dialled nodes.
         listener: Option<AnyListener>,
-        peers: Vec<FramedTransport<AnyStream>>,
+        peers: Vec<AnyTransport>,
     }
 
     impl Bus0 {
@@ -577,13 +664,11 @@ pub mod bus0 {
         /// [`accept_pending`](Self::accept_pending) can admit peers that
         /// connect after this call returns.
         pub async fn listen_and_accept(addr: &str, n: usize) -> io::Result<Self> {
-            let listener: AnyListener = bind_listener(addr).await?;
+            let listener = bind_listener(addr).await?;
             let mut peers = Vec::with_capacity(n);
             while peers.len() < n {
-                let stream = listener.accept().await?;
-                match connect_framed(stream, ProtocolId::BUS0).await {
-                    Ok(t) => peers.push(t),
-                    Err(_) => {}
+                if let Ok(t) = listener.accept_as_transport(ProtocolId::BUS0).await {
+                    peers.push(t);
                 }
             }
             Ok(Self {
@@ -594,37 +679,33 @@ pub mod bus0 {
 
         /// Dial one peer and return a `Bus0` with that single connection.
         pub async fn dial(addr: &str) -> io::Result<Self> {
-            let stream = connect_stream(addr).await?;
-            let transport = connect_framed(stream, ProtocolId::BUS0).await.map_err(te)?;
+            let transport = connect_transport(addr, ProtocolId::BUS0).await?;
             Ok(Self {
                 listener: None,
                 peers: vec![transport],
             })
         }
 
-        /// Accept any peers whose TCP connections arrived since the last call.
+        /// Accept any peers whose connections arrived since the last call.
         ///
         /// Returns immediately when the kernel accept queue is empty.  Only
         /// has an effect on nodes created with [`listen`](Self::listen) or
         /// [`listen_and_accept`](Self::listen_and_accept).
-        ///
-        /// `TcpListener::accept` does not consume partial data, so cancelling
-        /// it (when `ready()` wins the biased select) is safe.
         pub async fn accept_pending(&mut self) {
             let Some(listener) = &self.listener else {
                 return;
             };
             loop {
-                tokio::select! {
+                let raw = tokio::select! {
                     biased;
-                    result = listener.accept() => {
-                        if let Ok(stream) = result {
-                            if let Ok(t) = connect_framed(stream, ProtocolId::BUS0).await {
-                                self.peers.push(t);
-                            }
-                        }
-                    }
+                    result = listener.accept_raw() => match result {
+                        Ok(raw) => raw,
+                        Err(_) => break,
+                    },
                     _ = std::future::ready(()) => break,
+                };
+                if let Ok(t) = raw.into_transport(ProtocolId::BUS0).await {
+                    self.peers.push(t);
                 }
             }
         }
@@ -646,15 +727,7 @@ pub mod bus0 {
         /// Receive the next message from any connected peer.
         ///
         /// Polls peers in round-robin order with cooperative yielding between
-        /// passes.  Each iteration polls each peer non-blockingly using a
-        /// `biased` select; if no peer has data immediately available the task
-        /// yields before trying again.
-        ///
-        /// The `biased; ready(())` pattern here looks like a cancellation
-        /// hazard but is safe: [`FramedTransport::recv`] stores its partial-read
-        /// state in an internal [`RecvBuf`], so dropping the future mid-read and
-        /// retrying on the next pass produces exactly one complete message with
-        /// no corrupted frame boundaries.
+        /// passes.
         pub async fn recv_any(&mut self) -> io::Result<Message> {
             loop {
                 if self.peers.is_empty() {
@@ -688,7 +761,6 @@ pub mod bus0 {
                 .ok_or_else(|| io::Error::other("peer index out of range"))?
                 .recv()
                 .await
-                .map_err(te)
         }
 
         /// Number of currently connected peers.
@@ -713,14 +785,9 @@ pub mod pipeline0 {
         codec::ProtocolId,
         protocols::pipeline::{Pull0State, Push0State},
         socket::Socket,
-        transport::{FramedTransport, TransportError},
     };
 
-    use super::{AnyStream, bind_listener, connect_framed};
-
-    fn te(e: TransportError) -> io::Error {
-        io::Error::other(e.to_string())
-    }
+    use super::{AnyTransport, bind_listener};
 
     /// Push socket: sends messages to a single connected pull endpoint.
     pub struct Push0(Socket<Push0State>);
@@ -759,19 +826,18 @@ pub mod pipeline0 {
     /// Multi-worker push socket: distributes messages across N connected
     /// pullers in round-robin order.
     pub struct Push0Fan {
-        workers: Vec<FramedTransport<AnyStream>>,
+        workers: Vec<AnyTransport>,
         next: usize,
     }
 
     impl Push0Fan {
         /// Bind to `addr` and block until exactly `n` PULL connections have
-        /// completed the SP handshake.
+        /// completed the handshake.
         pub async fn listen_and_accept(addr: &str, n: usize) -> io::Result<Self> {
             let listener = bind_listener(addr).await?;
             let mut workers = Vec::with_capacity(n);
             while workers.len() < n {
-                let stream = listener.accept().await?;
-                if let Ok(t) = connect_framed(stream, ProtocolId::PUSH0).await {
+                if let Ok(t) = listener.accept_as_transport(ProtocolId::PUSH0).await {
                     workers.push(t);
                 }
             }
@@ -785,7 +851,7 @@ pub mod pipeline0 {
             }
             let i = self.next;
             self.next = (self.next + 1) % self.workers.len();
-            self.workers[i].send(&msg).await.map_err(te)
+            self.workers[i].send(&msg).await
         }
 
         /// Number of connected workers.
@@ -797,8 +863,8 @@ pub mod pipeline0 {
     /// Multi-sender pull socket: accepts N pushers and receives from whichever
     /// has data available first.
     ///
-    /// Each connected sender runs in its own tokio task so `recv()` is never
-    /// cancelled mid-read (which would corrupt TCP frame boundaries).
+    /// Each connected sender runs in its own tokio task so `recv` is never
+    /// cancelled mid-read.
     pub struct Pull0Fan {
         rx: tokio::sync::mpsc::Receiver<io::Result<Message>>,
         n: usize,
@@ -806,14 +872,13 @@ pub mod pipeline0 {
 
     impl Pull0Fan {
         /// Bind to `addr` and block until exactly `n` PUSH connections have
-        /// completed the SP handshake.
+        /// completed the handshake.
         pub async fn listen_and_accept(addr: &str, n: usize) -> io::Result<Self> {
             let listener = bind_listener(addr).await?;
             let (tx, rx) = tokio::sync::mpsc::channel(n * 4);
             let mut count = 0;
             while count < n {
-                let stream = listener.accept().await?;
-                if let Ok(mut transport) = connect_framed(stream, ProtocolId::PULL0).await {
+                if let Ok(mut transport) = listener.accept_as_transport(ProtocolId::PULL0).await {
                     let tx2 = tx.clone();
                     tokio::spawn(async move {
                         loop {
@@ -824,7 +889,7 @@ pub mod pipeline0 {
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = tx2.send(Err(te(e))).await;
+                                    let _ = tx2.send(Err(e)).await;
                                     break;
                                 }
                             }
@@ -845,7 +910,7 @@ pub mod pipeline0 {
                 match self.rx.recv().await {
                     None => return Err(io::Error::other("all senders disconnected")),
                     Some(Ok(msg)) => return Ok(msg),
-                    Some(Err(_)) => {} // one sender disconnected, drain remaining
+                    Some(Err(_)) => {}
                 }
             }
         }
@@ -890,8 +955,6 @@ pub mod pair0 {
 
 pub mod reqrep0 {
     //! REQ0 / REP0 socket API.
-    //!
-    //! Mirrors the `anng::protocols::reqrep0` interface closely.
 
     use std::io;
 
@@ -927,8 +990,7 @@ pub mod reqrep0 {
         }
     }
 
-    /// Reply socket: listens for connections from requesters, handles one
-    /// connection at a time.
+    /// Reply socket: listens for connections from requesters.
     pub struct Rep0 {
         inner: Socket<Rep0State>,
         state: Rep0State,
