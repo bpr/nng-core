@@ -7,6 +7,7 @@
 //! - `ws://host:port[/path]` — WebSocket (requires `ws` feature)
 //! - `wss://host:port[/path]` — Secure WebSocket / TLS (requires `wss` feature)
 //! - `tls+tcp://host:port` — TLS over TCP (requires `tls-tcp` feature)
+//! - `udp://host:port` — UDP datagram (requires `udp` feature; no SP handshake)
 //!
 //! Each socket type wraps an [`AnyTransport`], which dispatches to either
 //! [`FramedTransport`] (TCP / IPC) or [`WsTransport`] (WebSocket / TLS)
@@ -40,12 +41,17 @@ use crate::transport::tls_tcp::{
     TlsTcpStream, build_tls_acceptor as build_tls_tcp_acceptor, build_tls_connector,
 };
 
+#[cfg(feature = "udp")]
+use crate::transport::udp::UdpTransport;
+
 // ── AnyTransport: FramedTransport or WsTransport ─────────────────────────────
 
 pub(crate) enum AnyTransport {
     Framed(FramedTransport<AnyStream>),
     #[cfg(feature = "ws")]
     Ws(WsTransport),
+    #[cfg(feature = "udp")]
+    Udp(UdpTransport),
 }
 
 impl AnyTransport {
@@ -54,6 +60,8 @@ impl AnyTransport {
             Self::Framed(t) => t.send(msg).await.map_err(te_to_io),
             #[cfg(feature = "ws")]
             Self::Ws(t) => t.send(msg).await.map_err(ws_to_io),
+            #[cfg(feature = "udp")]
+            Self::Udp(t) => t.send(msg).await,
         }
     }
 
@@ -62,6 +70,8 @@ impl AnyTransport {
             Self::Framed(t) => t.recv().await.map_err(te_to_io),
             #[cfg(feature = "ws")]
             Self::Ws(t) => t.recv().await.map_err(ws_to_io),
+            #[cfg(feature = "udp")]
+            Self::Udp(t) => t.recv().await,
         }
     }
 }
@@ -329,6 +339,10 @@ pub(crate) async fn bind_listener(addr: &str) -> io::Result<AnyListener> {
         Err(io::Error::other(
             "tls+tcp:// requires listen_tls_tcp — use listen_tls_tcp(addr, cert_pem, key_pem)",
         ))
+    } else if addr.starts_with("udp://") {
+        Err(io::Error::other(
+            "udp:// is not supported for multi-connection sockets",
+        ))
     } else {
         Err(io::Error::other(format!("unsupported URL scheme: {addr}")))
     }
@@ -531,7 +545,16 @@ impl<P> Socket<P> {
 
     /// Bind and wait for the first incoming connection, then complete the
     /// handshake.  The listener is dropped after accepting one connection.
+    ///
+    /// For `udp://` URLs the socket is bound immediately and returned without
+    /// waiting; UDP has no connection concept and no SP handshake.
     pub async fn listen(addr: &str, proto: ProtocolId) -> io::Result<Self> {
+        #[cfg(feature = "udp")]
+        if let Some(udp_addr) = addr.strip_prefix("udp://") {
+            let transport = UdpTransport::bind(udp_addr).await?;
+            return Ok(Self::new(AnyTransport::Udp(transport)));
+        }
+        let _ = proto; // suppress unused-variable warning when only udp feature is active
         let listener = bind_listener(addr).await?;
         let transport = listener.accept_as_transport(proto).await?;
         Ok(Self::new(transport))
@@ -595,7 +618,15 @@ impl<P> Socket<P> {
     }
 
     /// Connect to `addr` and complete the handshake.
+    ///
+    /// For `udp://` URLs the socket is bound to an ephemeral port and
+    /// UDP-connected to the peer; no SP handshake is performed.
     pub async fn dial(addr: &str, proto: ProtocolId) -> io::Result<Self> {
+        #[cfg(feature = "udp")]
+        if let Some(udp_addr) = addr.strip_prefix("udp://") {
+            let transport = UdpTransport::connect(udp_addr).await?;
+            return Ok(Self::new(AnyTransport::Udp(transport)));
+        }
         let transport = connect_transport(addr, proto).await?;
         Ok(Self::new(transport))
     }

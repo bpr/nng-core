@@ -403,3 +403,8 @@ pub use ws::{WsError, WsTransport};
 
 #[cfg(feature = "tls-tcp")]
 pub mod tls_tcp;
+
+#[cfg(feature = "udp")]
+pub mod udp;
+#[cfg(feature = "udp")]
+pub use udp::UdpTransport;
