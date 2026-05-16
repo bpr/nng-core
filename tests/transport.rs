@@ -4,6 +4,98 @@ use nng_core::{
     transport::{FrameFormat, loopback::inproc_pair},
 };
 
+// ── ipc2:// tests (unix only) ─────────────────────────────────────────────────
+
+#[cfg(unix)]
+mod ipc2 {
+    use nng_core::{
+        Message,
+        socket::{pair0, reqrep0},
+    };
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn ipc2_loopback_pair() {
+        let url = "ipc2:///tmp/nng_core_ipc2_pair.sock";
+
+        let listen_task = tokio::spawn(async move { pair0::Pair0::listen(url).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut client = pair0::Pair0::dial(url).await.unwrap();
+        let mut server = listen_task.await.unwrap().unwrap();
+
+        let mut msg = Message::new();
+        msg.push_back(b"hello ipc2");
+        client.send(msg).await.unwrap();
+
+        let received = server.recv().await.unwrap();
+        assert_eq!(received.body(), b"hello ipc2");
+
+        let mut reply = Message::new();
+        reply.push_back(b"world");
+        server.send(reply).await.unwrap();
+
+        let got = client.recv().await.unwrap();
+        assert_eq!(got.body(), b"world");
+    }
+
+    #[tokio::test]
+    async fn ipc2_loopback_req_rep() {
+        let url = "ipc2:///tmp/nng_core_ipc2_reqrep.sock";
+        let url_owned = url.to_owned();
+
+        let listen_task = tokio::spawn(async move { reqrep0::Rep0::listen(&url_owned).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut req = reqrep0::Req0::dial(url).await.unwrap();
+        let mut rep = listen_task.await.unwrap().unwrap();
+
+        // Run req and rep concurrently: rep echoes the request body back.
+        let (response, _) = tokio::join!(
+            async {
+                let mut msg = Message::new();
+                msg.push_back(b"ping");
+                req.request(msg).await.unwrap()
+            },
+            async {
+                let (msg, responder) = rep.receive().await.unwrap();
+                assert_eq!(msg.body(), b"ping");
+                responder.reply(msg).await.unwrap();
+            },
+        );
+        assert_eq!(response.body(), b"ping");
+    }
+
+    // ipc:// (9-byte framing) and ipc2:// (8-byte framing) speak different
+    // frame formats.  The SP handshake succeeds (same 8 bytes), but the first
+    // message causes the listener to see a type byte of 0x00 instead of 0x01
+    // and return a BadFrameType error immediately.
+    #[tokio::test]
+    async fn ipc2_mismatch_with_ipc_errors() {
+        let path = "/tmp/nng_core_ipc_mismatch.sock";
+
+        let listen_task =
+            tokio::spawn(async move { pair0::Pair0::listen(&format!("ipc://{path}")).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut client = pair0::Pair0::dial(&format!("ipc2://{path}")).await.unwrap();
+        let mut server = listen_task.await.unwrap().unwrap();
+
+        let mut msg = Message::new();
+        msg.push_back(b"hello");
+        client.send(msg).await.unwrap();
+
+        // The server reads with 9-byte framing: the first byte of the 8-byte
+        // TCP-format length header is 0x00, not 0x01, so recv returns
+        // BadFrameType immediately rather than timing out.
+        let result = server.recv().await;
+        assert!(
+            result.is_err(),
+            "expected BadFrameType error due to frame format mismatch"
+        );
+    }
+}
+
 #[tokio::test]
 async fn loopback_req_rep_handshake_and_messages() {
     let (mut req, mut rep) = inproc_pair(ProtocolId::REQ0, ProtocolId::REP0)

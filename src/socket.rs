@@ -2,7 +2,8 @@
 //!
 //! Supported URL schemes:
 //! - `tcp://host:port` — plain TCP
-//! - `ipc:///path` — Unix domain socket (Unix only)
+//! - `ipc:///path` — Unix domain socket, NNG 1.5.x framing (9-byte header)
+//! - `ipc2:///path` — Unix domain socket, NNG 2.x framing (8-byte header, same as TCP)
 //! - `ws://host:port[/path]` — WebSocket (requires `ws` feature)
 //! - `wss://host:port[/path]` — Secure WebSocket / TLS (requires `wss` feature)
 //!
@@ -72,8 +73,12 @@ fn ws_to_io(e: WsError) -> io::Error {
 
 pub(crate) enum AnyStream {
     Tcp(TokioTcpStream),
+    /// NNG 1.5.x IPC: 9-byte frame header (0x01 type + 8-byte length).
     #[cfg(unix)]
     Ipc(TokioUnixStream),
+    /// NNG 2.x IPC: 8-byte frame header (same as TCP).
+    #[cfg(unix)]
+    Ipc2(TokioUnixStream),
 }
 
 impl ErrorType for AnyStream {
@@ -85,7 +90,7 @@ impl EioRead for AnyStream {
         match self {
             Self::Tcp(s) => EioRead::read(s, buf).await,
             #[cfg(unix)]
-            Self::Ipc(s) => EioRead::read(s, buf).await,
+            Self::Ipc(s) | Self::Ipc2(s) => EioRead::read(s, buf).await,
         }
     }
 }
@@ -95,7 +100,7 @@ impl EioWrite for AnyStream {
         match self {
             Self::Tcp(s) => EioWrite::write(s, buf).await,
             #[cfg(unix)]
-            Self::Ipc(s) => EioWrite::write(s, buf).await,
+            Self::Ipc(s) | Self::Ipc2(s) => EioWrite::write(s, buf).await,
         }
     }
 
@@ -103,7 +108,7 @@ impl EioWrite for AnyStream {
         match self {
             Self::Tcp(s) => EioWrite::flush(s).await,
             #[cfg(unix)]
-            Self::Ipc(s) => EioWrite::flush(s).await,
+            Self::Ipc(s) | Self::Ipc2(s) => EioWrite::flush(s).await,
         }
     }
 }
@@ -114,6 +119,8 @@ impl AnyStream {
             Self::Tcp(_) => FrameFormat::Tcp,
             #[cfg(unix)]
             Self::Ipc(_) => FrameFormat::Ipc,
+            #[cfg(unix)]
+            Self::Ipc2(_) => FrameFormat::Tcp,
         }
     }
 }
@@ -122,8 +129,12 @@ impl AnyStream {
 
 pub(crate) enum AnyListener {
     Tcp(TcpListener),
+    /// NNG 1.5.x IPC: 9-byte frame header.
     #[cfg(unix)]
     Ipc(UnixListener),
+    /// NNG 2.x IPC: 8-byte frame header (same as TCP).
+    #[cfg(unix)]
+    Ipc2(UnixListener),
     #[cfg(feature = "ws")]
     Ws(TcpListener),
     #[cfg(feature = "wss")]
@@ -146,6 +157,14 @@ impl AnyListener {
             Self::Ipc(l) => {
                 let (stream, _) = l.accept().await?;
                 connect_framed(AnyStream::Ipc(TokioUnixStream(stream)), proto)
+                    .await
+                    .map(AnyTransport::Framed)
+                    .map_err(te_to_io)
+            }
+            #[cfg(unix)]
+            Self::Ipc2(l) => {
+                let (stream, _) = l.accept().await?;
+                connect_framed(AnyStream::Ipc2(TokioUnixStream(stream)), proto)
                     .await
                     .map(AnyTransport::Framed)
                     .map_err(te_to_io)
@@ -183,6 +202,11 @@ impl AnyListener {
             Self::Ipc(l) => {
                 let (stream, _) = l.accept().await?;
                 Ok(RawConn::Stream(AnyStream::Ipc(TokioUnixStream(stream))))
+            }
+            #[cfg(unix)]
+            Self::Ipc2(l) => {
+                let (stream, _) = l.accept().await?;
+                Ok(RawConn::Stream(AnyStream::Ipc2(TokioUnixStream(stream))))
             }
             #[cfg(feature = "ws")]
             Self::Ws(l) => {
@@ -239,6 +263,8 @@ pub(crate) async fn bind_listener(addr: &str) -> io::Result<AnyListener> {
         TcpListener::bind(tcp_addr).await.map(AnyListener::Tcp)
     } else if let Some(ipc_path) = addr.strip_prefix("ipc://") {
         bind_ipc_listener(ipc_path)
+    } else if let Some(ipc_path) = addr.strip_prefix("ipc2://") {
+        bind_ipc2_listener(ipc_path)
     } else if let Some(ws_addr) = addr.strip_prefix("ws://") {
         #[cfg(feature = "ws")]
         {
@@ -289,6 +315,8 @@ pub(crate) async fn connect_stream(addr: &str) -> io::Result<AnyStream> {
             .map(|s| AnyStream::Tcp(TokioTcpStream(s)))
     } else if let Some(ipc_path) = addr.strip_prefix("ipc://") {
         connect_ipc_stream(ipc_path).await
+    } else if let Some(ipc_path) = addr.strip_prefix("ipc2://") {
+        connect_ipc2_stream(ipc_path).await
     } else {
         Err(io::Error::other(format!("unsupported URL scheme: {addr}")))
     }
@@ -342,6 +370,19 @@ fn bind_ipc_listener(_path: &str) -> io::Result<AnyListener> {
 }
 
 #[cfg(unix)]
+fn bind_ipc2_listener(path: &str) -> io::Result<AnyListener> {
+    let _ = std::fs::remove_file(path);
+    UnixListener::bind(path).map(AnyListener::Ipc2)
+}
+
+#[cfg(not(unix))]
+fn bind_ipc2_listener(_path: &str) -> io::Result<AnyListener> {
+    Err(io::Error::other(
+        "IPC (Unix domain sockets) is not supported on this platform",
+    ))
+}
+
+#[cfg(unix)]
 async fn connect_ipc_stream(path: &str) -> io::Result<AnyStream> {
     UnixStream::connect(path)
         .await
@@ -350,6 +391,20 @@ async fn connect_ipc_stream(path: &str) -> io::Result<AnyStream> {
 
 #[cfg(not(unix))]
 async fn connect_ipc_stream(_path: &str) -> io::Result<AnyStream> {
+    Err(io::Error::other(
+        "IPC (Unix domain sockets) is not supported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+async fn connect_ipc2_stream(path: &str) -> io::Result<AnyStream> {
+    UnixStream::connect(path)
+        .await
+        .map(|s| AnyStream::Ipc2(TokioUnixStream(s)))
+}
+
+#[cfg(not(unix))]
+async fn connect_ipc2_stream(_path: &str) -> io::Result<AnyStream> {
     Err(io::Error::other(
         "IPC (Unix domain sockets) is not supported on this platform",
     ))
