@@ -1,11 +1,14 @@
 //! High-level socket API for nng-core (requires `std` / tokio).
 //!
-//! Supported URL schemes: `tcp://host:port`, `ipc:///path` (Unix only),
-//! and `ws://host:port[/path]` (requires the `ws` Cargo feature).
+//! Supported URL schemes:
+//! - `tcp://host:port` — plain TCP
+//! - `ipc:///path` — Unix domain socket (Unix only)
+//! - `ws://host:port[/path]` — WebSocket (requires `ws` feature)
+//! - `wss://host:port[/path]` — Secure WebSocket / TLS (requires `wss` feature)
 //!
 //! Each socket type wraps an [`AnyTransport`], which dispatches to either
-//! [`FramedTransport`] (TCP / IPC) or [`WsTransport`] (WebSocket) depending
-//! on the URL scheme used at construction time.
+//! [`FramedTransport`] (TCP / IPC) or [`WsTransport`] (WebSocket / TLS)
+//! depending on the URL scheme used at construction time.
 
 use std::io;
 
@@ -26,6 +29,9 @@ use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(feature = "ws")]
 use crate::transport::ws::{WsError, WsTransport};
+
+#[cfg(feature = "wss")]
+use crate::transport::ws::build_tls_acceptor;
 
 // ── AnyTransport: FramedTransport or WsTransport ─────────────────────────────
 
@@ -120,6 +126,8 @@ pub(crate) enum AnyListener {
     Ipc(UnixListener),
     #[cfg(feature = "ws")]
     Ws(TcpListener),
+    #[cfg(feature = "wss")]
+    Wss(TcpListener, tokio_rustls::TlsAcceptor),
 }
 
 impl AnyListener {
@@ -150,6 +158,14 @@ impl AnyListener {
                     .map(AnyTransport::Ws)
                     .map_err(ws_to_io)
             }
+            #[cfg(feature = "wss")]
+            Self::Wss(l, acceptor) => {
+                let (tcp, _) = l.accept().await?;
+                WsTransport::accept_tls_with_acceptor(tcp, proto, acceptor)
+                    .await
+                    .map(AnyTransport::Ws)
+                    .map_err(ws_to_io)
+            }
         }
     }
 
@@ -173,6 +189,11 @@ impl AnyListener {
                 let (tcp, _) = l.accept().await?;
                 Ok(RawConn::Ws(tcp))
             }
+            #[cfg(feature = "wss")]
+            Self::Wss(l, acceptor) => {
+                let (tcp, _) = l.accept().await?;
+                Ok(RawConn::Wss(tcp, acceptor.clone()))
+            }
         }
     }
 }
@@ -182,6 +203,8 @@ pub(crate) enum RawConn {
     Stream(AnyStream),
     #[cfg(feature = "ws")]
     Ws(TcpStream),
+    #[cfg(feature = "wss")]
+    Wss(TcpStream, tokio_rustls::TlsAcceptor),
 }
 
 impl RawConn {
@@ -198,6 +221,13 @@ impl RawConn {
                 .await
                 .map(AnyTransport::Ws)
                 .map_err(ws_to_io),
+            #[cfg(feature = "wss")]
+            Self::Wss(tcp, acceptor) => {
+                WsTransport::accept_tls_with_acceptor(tcp, proto, &acceptor)
+                    .await
+                    .map(AnyTransport::Ws)
+                    .map_err(ws_to_io)
+            }
         }
     }
 }
@@ -221,9 +251,35 @@ pub(crate) async fn bind_listener(addr: &str) -> io::Result<AnyListener> {
             let _ = ws_addr;
             return Err(io::Error::other("ws:// requires the `ws` Cargo feature"));
         }
+    } else if addr.starts_with("wss://") {
+        Err(io::Error::other(
+            "wss:// requires listen_tls — use listen_tls(addr, cert_pem, key_pem)",
+        ))
     } else {
         Err(io::Error::other(format!("unsupported URL scheme: {addr}")))
     }
+}
+
+/// Bind a TLS WebSocket listener.
+///
+/// Loads the certificate chain and private key from PEM files once; the
+/// resulting `TlsAcceptor` is reused for every incoming connection.
+#[cfg(feature = "wss")]
+pub(crate) async fn bind_listener_tls(
+    addr: &str,
+    cert_pem: &std::path::Path,
+    key_pem: &std::path::Path,
+) -> io::Result<AnyListener> {
+    let host_port = addr
+        .strip_prefix("wss://")
+        .ok_or_else(|| io::Error::other("bind_listener_tls requires a wss:// URL"))?
+        .split('/')
+        .next()
+        .unwrap_or(addr);
+    let acceptor =
+        build_tls_acceptor(cert_pem, key_pem).map_err(|e| io::Error::other(e.to_string()))?;
+    let listener = TcpListener::bind(host_port).await?;
+    Ok(AnyListener::Wss(listener, acceptor))
 }
 
 pub(crate) async fn connect_stream(addr: &str) -> io::Result<AnyStream> {
@@ -245,6 +301,13 @@ pub(crate) async fn connect_stream(addr: &str) -> io::Result<AnyStream> {
 pub(crate) async fn connect_transport(addr: &str, proto: ProtocolId) -> io::Result<AnyTransport> {
     #[cfg(feature = "ws")]
     if addr.starts_with("ws://") {
+        return WsTransport::connect(addr, proto)
+            .await
+            .map(AnyTransport::Ws)
+            .map_err(ws_to_io);
+    }
+    #[cfg(feature = "wss")]
+    if addr.starts_with("wss://") {
         return WsTransport::connect(addr, proto)
             .await
             .map(AnyTransport::Ws)
@@ -312,6 +375,23 @@ impl<P> Socket<P> {
     /// handshake.  The listener is dropped after accepting one connection.
     pub async fn listen(addr: &str, proto: ProtocolId) -> io::Result<Self> {
         let listener = bind_listener(addr).await?;
+        let transport = listener.accept_as_transport(proto).await?;
+        Ok(Self::new(transport))
+    }
+
+    /// Bind a TLS WebSocket listener and wait for the first connection.
+    ///
+    /// Loads the server certificate and private key from PEM files once,
+    /// then performs the TLS handshake and WebSocket upgrade on the first
+    /// accepted connection.
+    #[cfg(feature = "wss")]
+    pub async fn listen_tls(
+        addr: &str,
+        proto: ProtocolId,
+        cert_pem: &std::path::Path,
+        key_pem: &std::path::Path,
+    ) -> io::Result<Self> {
+        let listener = bind_listener_tls(addr, cert_pem, key_pem).await?;
         let transport = listener.accept_as_transport(proto).await?;
         Ok(Self::new(transport))
     }
@@ -797,6 +877,17 @@ pub mod pipeline0 {
             Socket::listen(addr, ProtocolId::PUSH0).await.map(Self)
         }
 
+        #[cfg(feature = "wss")]
+        pub async fn listen_tls(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> io::Result<Self> {
+            Socket::listen_tls(addr, ProtocolId::PUSH0, cert_pem, key_pem)
+                .await
+                .map(Self)
+        }
+
         pub async fn dial(addr: &str) -> io::Result<Self> {
             Socket::dial(addr, ProtocolId::PUSH0).await.map(Self)
         }
@@ -812,6 +903,17 @@ pub mod pipeline0 {
     impl Pull0 {
         pub async fn listen(addr: &str) -> io::Result<Self> {
             Socket::listen(addr, ProtocolId::PULL0).await.map(Self)
+        }
+
+        #[cfg(feature = "wss")]
+        pub async fn listen_tls(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> io::Result<Self> {
+            Socket::listen_tls(addr, ProtocolId::PULL0, cert_pem, key_pem)
+                .await
+                .map(Self)
         }
 
         pub async fn dial(addr: &str) -> io::Result<Self> {
@@ -939,6 +1041,17 @@ pub mod pair0 {
             Socket::listen(addr, ProtocolId::PAIR0).await.map(Self)
         }
 
+        #[cfg(feature = "wss")]
+        pub async fn listen_tls(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> io::Result<Self> {
+            Socket::listen_tls(addr, ProtocolId::PAIR0, cert_pem, key_pem)
+                .await
+                .map(Self)
+        }
+
         pub async fn dial(addr: &str) -> io::Result<Self> {
             Socket::dial(addr, ProtocolId::PAIR0).await.map(Self)
         }
@@ -1017,6 +1130,20 @@ pub mod reqrep0 {
                 inner: s,
                 state: Rep0State::new(),
             })
+        }
+
+        #[cfg(feature = "wss")]
+        pub async fn listen_tls(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> io::Result<Self> {
+            Socket::listen_tls(addr, ProtocolId::REP0, cert_pem, key_pem)
+                .await
+                .map(|s| Self {
+                    inner: s,
+                    state: Rep0State::new(),
+                })
         }
 
         /// Receive the next request.  Returns the application message plus a

@@ -390,3 +390,235 @@ mod websocat_interop {
         let _ = child.kill().await;
     }
 }
+
+// ── 4. wss:// TLS loopback ────────────────────────────────────────────────────
+
+#[cfg(feature = "wss")]
+mod tls {
+    use nng_core::{
+        Message,
+        codec::ProtocolId,
+        socket::{pair0, reqrep0},
+        transport::ws::WsTransport,
+    };
+    use std::{io::Write, sync::Arc};
+    use tokio::net::TcpListener;
+
+    // ── cert helpers ─────────────────────────────────────────────────────────
+
+    struct TestCerts {
+        cert_file: tempfile::NamedTempFile,
+        key_file: tempfile::NamedTempFile,
+        /// DER-encoded certificate for building a trusting client config.
+        cert_der: rustls::pki_types::CertificateDer<'static>,
+    }
+
+    fn make_test_certs() -> TestCerts {
+        let CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        cert_file.write_all(cert.pem().as_bytes()).unwrap();
+        cert_file.flush().unwrap();
+
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        key_file
+            .write_all(signing_key.serialize_pem().as_bytes())
+            .unwrap();
+        key_file.flush().unwrap();
+
+        TestCerts {
+            cert_file,
+            key_file,
+            cert_der,
+        }
+    }
+
+    use rcgen::CertifiedKey;
+
+    /// Build a rustls `ClientConfig` that trusts only our self-signed cert.
+    fn trusting_client_config(
+        cert_der: &rustls::pki_types::CertificateDer<'_>,
+    ) -> Arc<rustls::ClientConfig> {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der.clone().into_owned()).unwrap();
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        )
+    }
+
+    // ── raw WsTransport TLS loopback ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn accept_tls_echo() {
+        let certs = make_test_certs();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = format!("wss://localhost:{port}");
+
+        let cert_path = certs.cert_file.path().to_path_buf();
+        let key_path = certs.key_file.path().to_path_buf();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut t = WsTransport::accept_tls(tcp, ProtocolId::REP0, &cert_path, &key_path)
+                .await
+                .unwrap();
+            let msg = t.recv().await.unwrap();
+            t.send(&msg).await.unwrap();
+        });
+
+        let client_config = trusting_client_config(&certs.cert_der);
+        let connector = tokio_tungstenite::Connector::Rustls(client_config);
+
+        let mut client = WsTransport::connect_with_tls(&addr, ProtocolId::REQ0, connector)
+            .await
+            .unwrap();
+        let mut req = Message::new();
+        req.push_back(b"hello over TLS");
+        client.send(&req).await.unwrap();
+        let reply = client.recv().await.unwrap();
+        assert_eq!(reply.body(), b"hello over TLS");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_tls_many_messages() {
+        let certs = make_test_certs();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = format!("wss://localhost:{port}");
+
+        let cert_path = certs.cert_file.path().to_path_buf();
+        let key_path = certs.key_file.path().to_path_buf();
+
+        const N: u32 = 30;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut t = WsTransport::accept_tls(tcp, ProtocolId::REP0, &cert_path, &key_path)
+                .await
+                .unwrap();
+            for _ in 0..N {
+                let msg = t.recv().await.unwrap();
+                t.send(&msg).await.unwrap();
+            }
+        });
+
+        let client_config = trusting_client_config(&certs.cert_der);
+        let connector = tokio_tungstenite::Connector::Rustls(client_config);
+        let mut client = WsTransport::connect_with_tls(&addr, ProtocolId::REQ0, connector)
+            .await
+            .unwrap();
+
+        for i in 0u32..N {
+            let mut req = Message::new();
+            req.push_back(&i.to_be_bytes());
+            client.send(&req).await.unwrap();
+            let reply = client.recv().await.unwrap();
+            assert_eq!(reply.body(), &i.to_be_bytes());
+        }
+
+        server.await.unwrap();
+    }
+
+    // ── socket API over wss:// ────────────────────────────────────────────────
+
+    /// Helper: make a temporary self-signed cert, return cert+key paths + DER.
+    async fn free_wss_addr() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        format!("wss://localhost:{port}")
+    }
+
+    #[tokio::test]
+    async fn req_rep_wss() {
+        let certs = make_test_certs();
+        let addr = free_wss_addr().await;
+        let server_addr = addr.clone();
+
+        let cert_path = certs.cert_file.path().to_path_buf();
+        let key_path = certs.key_file.path().to_path_buf();
+
+        let server = tokio::spawn(async move {
+            let mut rep = reqrep0::Rep0::listen_tls(&server_addr, &cert_path, &key_path)
+                .await
+                .unwrap();
+            let (msg, responder) = rep.receive().await.unwrap();
+            assert_eq!(msg.body(), b"secure ping");
+            let mut reply = Message::new();
+            reply.push_back(b"secure pong");
+            responder.reply(reply).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let client_config = trusting_client_config(&certs.cert_der);
+        let connector = tokio_tungstenite::Connector::Rustls(client_config);
+        let mut client = WsTransport::connect_with_tls(&addr, ProtocolId::REQ0, connector)
+            .await
+            .unwrap();
+
+        // REQ0 wire format: 4-byte request ID (high bit set) followed by body.
+        // The Rep0 state machine strips those 4 bytes before handing msg to the app.
+        let req_id: u32 = 0x8000_0001;
+        let mut payload = req_id.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"secure ping");
+        let mut raw_req = Message::new();
+        raw_req.push_back(&payload);
+        client.send(&raw_req).await.unwrap();
+
+        // Reply has the same 4-byte ID prepended by Rep0; read and discard.
+        client.recv().await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pair_wss_bidirectional() {
+        let certs = make_test_certs();
+        let addr = free_wss_addr().await;
+        let server_addr = addr.clone();
+
+        let cert_path = certs.cert_file.path().to_path_buf();
+        let key_path = certs.key_file.path().to_path_buf();
+
+        let server = tokio::spawn(async move {
+            let mut pair = pair0::Pair0::listen_tls(&server_addr, &cert_path, &key_path)
+                .await
+                .unwrap();
+            for i in 0u32..10 {
+                let msg = pair.recv().await.unwrap();
+                assert_eq!(msg.body(), &i.to_be_bytes());
+                let mut reply = Message::new();
+                reply.push_back(&(i + 200).to_be_bytes());
+                pair.send(reply).await.unwrap();
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let client_config = trusting_client_config(&certs.cert_der);
+        let connector = tokio_tungstenite::Connector::Rustls(client_config);
+        let mut pair = WsTransport::connect_with_tls(&addr, ProtocolId::PAIR0, connector)
+            .await
+            .unwrap();
+
+        for i in 0u32..10 {
+            let mut msg = Message::new();
+            msg.push_back(&i.to_be_bytes());
+            pair.send(&msg).await.unwrap();
+            let reply = pair.recv().await.unwrap();
+            assert_eq!(reply.body(), &(i + 200).to_be_bytes());
+        }
+
+        server.await.unwrap();
+    }
+}
