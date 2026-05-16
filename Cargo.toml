@@ -15,8 +15,9 @@ keywords = ["nng", "nanomsg", "zeromq", "zmq"]
 [features]
 default = ["std"]
 std = ["dep:tokio", "embedded-io-async/std"]
-ws  = ["std", "dep:tokio-tungstenite", "dep:futures-util"]
-wss = ["ws", "tokio-tungstenite/rustls-tls-native-roots", "dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
+ws      = ["std", "dep:tokio-tungstenite", "dep:futures-util"]
+wss     = ["ws", "tokio-tungstenite/rustls-tls-native-roots", "dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
+tls-tcp = ["std", "dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs"]
 
 [dependencies]
 embedded-io-async = "0.7"
@@ -26,6 +27,7 @@ futures-util = { version = "0.3", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std"] }
 rustls-pemfile = { version = "2", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

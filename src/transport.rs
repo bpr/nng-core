@@ -400,3 +400,6 @@ pub mod loopback {
 pub mod ws;
 #[cfg(feature = "ws")]
 pub use ws::{WsError, WsTransport};
+
+#[cfg(feature = "tls-tcp")]
+pub mod tls_tcp;

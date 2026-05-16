@@ -6,6 +6,7 @@
 //! - `ipc2:///path` — Unix domain socket, NNG 2.x framing (8-byte header, same as TCP)
 //! - `ws://host:port[/path]` — WebSocket (requires `ws` feature)
 //! - `wss://host:port[/path]` — Secure WebSocket / TLS (requires `wss` feature)
+//! - `tls+tcp://host:port` — TLS over TCP (requires `tls-tcp` feature)
 //!
 //! Each socket type wraps an [`AnyTransport`], which dispatches to either
 //! [`FramedTransport`] (TCP / IPC) or [`WsTransport`] (WebSocket / TLS)
@@ -33,6 +34,11 @@ use crate::transport::ws::{WsError, WsTransport};
 
 #[cfg(feature = "wss")]
 use crate::transport::ws::build_tls_acceptor;
+
+#[cfg(feature = "tls-tcp")]
+use crate::transport::tls_tcp::{
+    TlsTcpStream, build_tls_acceptor as build_tls_tcp_acceptor, build_tls_connector,
+};
 
 // ── AnyTransport: FramedTransport or WsTransport ─────────────────────────────
 
@@ -79,6 +85,9 @@ pub(crate) enum AnyStream {
     /// NNG 2.x IPC: 8-byte frame header (same as TCP).
     #[cfg(unix)]
     Ipc2(TokioUnixStream),
+    /// TLS over TCP: 8-byte frame header, TLS socket layer.
+    #[cfg(feature = "tls-tcp")]
+    TlsTcp(TlsTcpStream),
 }
 
 impl ErrorType for AnyStream {
@@ -91,6 +100,8 @@ impl EioRead for AnyStream {
             Self::Tcp(s) => EioRead::read(s, buf).await,
             #[cfg(unix)]
             Self::Ipc(s) | Self::Ipc2(s) => EioRead::read(s, buf).await,
+            #[cfg(feature = "tls-tcp")]
+            Self::TlsTcp(s) => EioRead::read(s, buf).await,
         }
     }
 }
@@ -101,6 +112,8 @@ impl EioWrite for AnyStream {
             Self::Tcp(s) => EioWrite::write(s, buf).await,
             #[cfg(unix)]
             Self::Ipc(s) | Self::Ipc2(s) => EioWrite::write(s, buf).await,
+            #[cfg(feature = "tls-tcp")]
+            Self::TlsTcp(s) => EioWrite::write(s, buf).await,
         }
     }
 
@@ -109,6 +122,8 @@ impl EioWrite for AnyStream {
             Self::Tcp(s) => EioWrite::flush(s).await,
             #[cfg(unix)]
             Self::Ipc(s) | Self::Ipc2(s) => EioWrite::flush(s).await,
+            #[cfg(feature = "tls-tcp")]
+            Self::TlsTcp(s) => EioWrite::flush(s).await,
         }
     }
 }
@@ -121,6 +136,8 @@ impl AnyStream {
             Self::Ipc(_) => FrameFormat::Ipc,
             #[cfg(unix)]
             Self::Ipc2(_) => FrameFormat::Tcp,
+            #[cfg(feature = "tls-tcp")]
+            Self::TlsTcp(_) => FrameFormat::Tcp,
         }
     }
 }
@@ -139,6 +156,9 @@ pub(crate) enum AnyListener {
     Ws(TcpListener),
     #[cfg(feature = "wss")]
     Wss(TcpListener, tokio_rustls::TlsAcceptor),
+    /// TLS over TCP: 8-byte frame header, TLS socket layer.
+    #[cfg(feature = "tls-tcp")]
+    TlsTcp(TcpListener, tokio_rustls::TlsAcceptor),
 }
 
 impl AnyListener {
@@ -185,6 +205,15 @@ impl AnyListener {
                     .map(AnyTransport::Ws)
                     .map_err(ws_to_io)
             }
+            #[cfg(feature = "tls-tcp")]
+            Self::TlsTcp(l, acceptor) => {
+                let (tcp, _) = l.accept().await?;
+                let tls = acceptor.accept(tcp).await.map_err(io::Error::other)?;
+                connect_framed(AnyStream::TlsTcp(TlsTcpStream::Server(tls)), proto)
+                    .await
+                    .map(AnyTransport::Framed)
+                    .map_err(te_to_io)
+            }
         }
     }
 
@@ -218,6 +247,11 @@ impl AnyListener {
                 let (tcp, _) = l.accept().await?;
                 Ok(RawConn::Wss(tcp, acceptor.clone()))
             }
+            #[cfg(feature = "tls-tcp")]
+            Self::TlsTcp(l, acceptor) => {
+                let (tcp, _) = l.accept().await?;
+                Ok(RawConn::TlsTcp(tcp, acceptor.clone()))
+            }
         }
     }
 }
@@ -229,6 +263,8 @@ pub(crate) enum RawConn {
     Ws(TcpStream),
     #[cfg(feature = "wss")]
     Wss(TcpStream, tokio_rustls::TlsAcceptor),
+    #[cfg(feature = "tls-tcp")]
+    TlsTcp(TcpStream, tokio_rustls::TlsAcceptor),
 }
 
 impl RawConn {
@@ -251,6 +287,14 @@ impl RawConn {
                     .await
                     .map(AnyTransport::Ws)
                     .map_err(ws_to_io)
+            }
+            #[cfg(feature = "tls-tcp")]
+            Self::TlsTcp(tcp, acceptor) => {
+                let tls = acceptor.accept(tcp).await.map_err(io::Error::other)?;
+                connect_framed(AnyStream::TlsTcp(TlsTcpStream::Server(tls)), proto)
+                    .await
+                    .map(AnyTransport::Framed)
+                    .map_err(te_to_io)
             }
         }
     }
@@ -281,9 +325,34 @@ pub(crate) async fn bind_listener(addr: &str) -> io::Result<AnyListener> {
         Err(io::Error::other(
             "wss:// requires listen_tls — use listen_tls(addr, cert_pem, key_pem)",
         ))
+    } else if addr.starts_with("tls+tcp://") {
+        Err(io::Error::other(
+            "tls+tcp:// requires listen_tls_tcp — use listen_tls_tcp(addr, cert_pem, key_pem)",
+        ))
     } else {
         Err(io::Error::other(format!("unsupported URL scheme: {addr}")))
     }
+}
+
+/// Bind a `tls+tcp://` listener.
+///
+/// Loads the certificate chain and private key from PEM files once; the
+/// resulting `TlsAcceptor` is reused for every incoming connection.
+#[cfg(feature = "tls-tcp")]
+pub(crate) async fn bind_listener_tls_tcp(
+    addr: &str,
+    cert_pem: &std::path::Path,
+    key_pem: &std::path::Path,
+) -> io::Result<AnyListener> {
+    let host_port = addr
+        .strip_prefix("tls+tcp://")
+        .ok_or_else(|| io::Error::other("bind_listener_tls_tcp requires a tls+tcp:// URL"))?
+        .split('/')
+        .next()
+        .unwrap_or(addr);
+    let acceptor = build_tls_tcp_acceptor(cert_pem, key_pem)?;
+    let listener = TcpListener::bind(host_port).await?;
+    Ok(AnyListener::TlsTcp(listener, acceptor))
 }
 
 /// Bind a TLS WebSocket listener.
@@ -317,6 +386,18 @@ pub(crate) async fn connect_stream(addr: &str) -> io::Result<AnyStream> {
         connect_ipc_stream(ipc_path).await
     } else if let Some(ipc_path) = addr.strip_prefix("ipc2://") {
         connect_ipc2_stream(ipc_path).await
+    } else if let Some(tls_addr) = addr.strip_prefix("tls+tcp://") {
+        #[cfg(feature = "tls-tcp")]
+        {
+            return connect_tls_tcp_stream(tls_addr).await;
+        }
+        #[cfg(not(feature = "tls-tcp"))]
+        {
+            let _ = tls_addr;
+            return Err(io::Error::other(
+                "tls+tcp:// requires the `tls-tcp` Cargo feature",
+            ));
+        }
     } else {
         Err(io::Error::other(format!("unsupported URL scheme: {addr}")))
     }
@@ -354,6 +435,28 @@ pub(crate) async fn connect_framed(
 ) -> Result<FramedTransport<AnyStream>, TransportError> {
     let format = stream.frame_format();
     FramedTransport::connect(stream, proto, format).await
+}
+
+#[cfg(feature = "tls-tcp")]
+async fn connect_tls_tcp_stream(host_port: &str) -> io::Result<AnyStream> {
+    let connector = build_tls_connector()?;
+    connect_tls_tcp_stream_with(host_port, connector).await
+}
+
+#[cfg(feature = "tls-tcp")]
+async fn connect_tls_tcp_stream_with(
+    host_port: &str,
+    connector: tokio_rustls::TlsConnector,
+) -> io::Result<AnyStream> {
+    // Strip any path component (e.g. tls+tcp://host:port/ignored).
+    let addr = host_port.split('/').next().unwrap_or(host_port);
+    // Extract host for TLS SNI — everything before the last ':'.
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|_| io::Error::other(format!("invalid TLS server name: {host}")))?;
+    let tcp = TcpStream::connect(addr).await?;
+    let tls = connector.connect(server_name, tcp).await?;
+    Ok(AnyStream::TlsTcp(TlsTcpStream::Client(tls)))
 }
 
 #[cfg(unix)]
@@ -434,6 +537,23 @@ impl<P> Socket<P> {
         Ok(Self::new(transport))
     }
 
+    /// Bind a `tls+tcp://` listener and wait for the first connection.
+    ///
+    /// Loads the server certificate and private key from PEM files once,
+    /// then performs the TLS handshake on the first accepted connection and
+    /// runs the SP framing handshake over the encrypted stream.
+    #[cfg(feature = "tls-tcp")]
+    pub async fn listen_tls_tcp(
+        addr: &str,
+        proto: ProtocolId,
+        cert_pem: &std::path::Path,
+        key_pem: &std::path::Path,
+    ) -> io::Result<Self> {
+        let listener = bind_listener_tls_tcp(addr, cert_pem, key_pem).await?;
+        let transport = listener.accept_as_transport(proto).await?;
+        Ok(Self::new(transport))
+    }
+
     /// Bind a TLS WebSocket listener and wait for the first connection.
     ///
     /// Loads the server certificate and private key from PEM files once,
@@ -449,6 +569,29 @@ impl<P> Socket<P> {
         let listener = bind_listener_tls(addr, cert_pem, key_pem).await?;
         let transport = listener.accept_as_transport(proto).await?;
         Ok(Self::new(transport))
+    }
+
+    /// Dial a `tls+tcp://` server with a custom `ClientConfig`.
+    ///
+    /// Use this when the server presents a self-signed certificate (e.g. in
+    /// tests).  For production servers with public CA certificates, use
+    /// [`dial`](Self::dial) with a `tls+tcp://` URL, which uses the system's
+    /// native root certificate store.
+    #[cfg(feature = "tls-tcp")]
+    pub async fn dial_tls_tcp(
+        addr: &str,
+        proto: ProtocolId,
+        client_config: std::sync::Arc<rustls::ClientConfig>,
+    ) -> io::Result<Self> {
+        let host_port = addr
+            .strip_prefix("tls+tcp://")
+            .ok_or_else(|| io::Error::other("dial_tls_tcp requires a tls+tcp:// URL"))?;
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let stream = connect_tls_tcp_stream_with(host_port, connector).await?;
+        connect_framed(stream, proto)
+            .await
+            .map(|t| Self::new(AnyTransport::Framed(t)))
+            .map_err(te_to_io)
     }
 
     /// Connect to `addr` and complete the handshake.
@@ -943,6 +1086,27 @@ pub mod pipeline0 {
                 .map(Self)
         }
 
+        #[cfg(feature = "tls-tcp")]
+        pub async fn listen_tls_tcp(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> io::Result<Self> {
+            Socket::listen_tls_tcp(addr, ProtocolId::PUSH0, cert_pem, key_pem)
+                .await
+                .map(Self)
+        }
+
+        #[cfg(feature = "tls-tcp")]
+        pub async fn dial_tls_tcp(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> io::Result<Self> {
+            Socket::dial_tls_tcp(addr, ProtocolId::PUSH0, client_config)
+                .await
+                .map(Self)
+        }
+
         pub async fn dial(addr: &str) -> io::Result<Self> {
             Socket::dial(addr, ProtocolId::PUSH0).await.map(Self)
         }
@@ -967,6 +1131,27 @@ pub mod pipeline0 {
             key_pem: &std::path::Path,
         ) -> io::Result<Self> {
             Socket::listen_tls(addr, ProtocolId::PULL0, cert_pem, key_pem)
+                .await
+                .map(Self)
+        }
+
+        #[cfg(feature = "tls-tcp")]
+        pub async fn listen_tls_tcp(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> io::Result<Self> {
+            Socket::listen_tls_tcp(addr, ProtocolId::PULL0, cert_pem, key_pem)
+                .await
+                .map(Self)
+        }
+
+        #[cfg(feature = "tls-tcp")]
+        pub async fn dial_tls_tcp(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> io::Result<Self> {
+            Socket::dial_tls_tcp(addr, ProtocolId::PULL0, client_config)
                 .await
                 .map(Self)
         }
@@ -1107,6 +1292,27 @@ pub mod pair0 {
                 .map(Self)
         }
 
+        #[cfg(feature = "tls-tcp")]
+        pub async fn listen_tls_tcp(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> io::Result<Self> {
+            Socket::listen_tls_tcp(addr, ProtocolId::PAIR0, cert_pem, key_pem)
+                .await
+                .map(Self)
+        }
+
+        #[cfg(feature = "tls-tcp")]
+        pub async fn dial_tls_tcp(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> io::Result<Self> {
+            Socket::dial_tls_tcp(addr, ProtocolId::PAIR0, client_config)
+                .await
+                .map(Self)
+        }
+
         pub async fn dial(addr: &str) -> io::Result<Self> {
             Socket::dial(addr, ProtocolId::PAIR0).await.map(Self)
         }
@@ -1139,6 +1345,16 @@ pub mod reqrep0 {
     impl Req0 {
         pub async fn dial(addr: &str) -> io::Result<Self> {
             Socket::dial(addr, ProtocolId::REQ0).await.map(Self)
+        }
+
+        #[cfg(feature = "tls-tcp")]
+        pub async fn dial_tls_tcp(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> io::Result<Self> {
+            Socket::dial_tls_tcp(addr, ProtocolId::REQ0, client_config)
+                .await
+                .map(Self)
         }
 
         /// Send `msg` and receive the reply.  The request ID is managed
@@ -1194,6 +1410,20 @@ pub mod reqrep0 {
             key_pem: &std::path::Path,
         ) -> io::Result<Self> {
             Socket::listen_tls(addr, ProtocolId::REP0, cert_pem, key_pem)
+                .await
+                .map(|s| Self {
+                    inner: s,
+                    state: Rep0State::new(),
+                })
+        }
+
+        #[cfg(feature = "tls-tcp")]
+        pub async fn listen_tls_tcp(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> io::Result<Self> {
+            Socket::listen_tls_tcp(addr, ProtocolId::REP0, cert_pem, key_pem)
                 .await
                 .map(|s| Self {
                     inner: s,
