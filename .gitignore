@@ -3,3 +3,4 @@ Cargo.lock
 fuzz/target/
 ws_nng_plan.md
 secure_websockets.md
+nngv2.md
