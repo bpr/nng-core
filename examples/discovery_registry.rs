@@ -19,6 +19,7 @@ const SURVEY_INTERVAL: Duration = Duration::from_secs(3);
 #[tokio::main]
 async fn main() {
     let mut surveyor = Surveyor0::listen(ADDR).await.expect("listen failed");
+    surveyor.set_survey_time(SURVEY_TIMEOUT);
     println!("[registry] listening on {ADDR}");
 
     // Wait for at least one node before starting surveys.
@@ -33,7 +34,7 @@ async fn main() {
         query.push_back(b"ROLL_CALL");
 
         println!("[registry] --- survey ---");
-        match surveyor.survey(query, SURVEY_TIMEOUT).await {
+        match surveyor.survey(query).await {
             Ok(replies) if replies.is_empty() => {
                 println!("[registry] no responses");
             }

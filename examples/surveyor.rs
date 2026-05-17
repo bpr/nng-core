@@ -28,7 +28,7 @@ async fn main() {
     q.push_back(b"ROLL_CALL");
 
     let responses = surveyor
-        .survey(q, Duration::from_secs(1))
+        .survey_with_timeout(q, Duration::from_secs(1))
         .await
         .expect("survey failed");
 

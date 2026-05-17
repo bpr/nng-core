@@ -45,7 +45,7 @@ async fn main() {
     let mut q = Message::new();
     write!(q, "status?").unwrap();
     let responses = surveyor
-        .survey(q, Duration::from_secs(1))
+        .survey_with_timeout(q, Duration::from_secs(1))
         .await
         .expect("survey failed");
 

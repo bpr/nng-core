@@ -49,10 +49,16 @@
 extern crate alloc;
 
 pub mod codec;
+#[cfg(feature = "std")]
+pub mod error;
 pub mod message;
 pub mod protocols;
 #[cfg(feature = "std")]
 pub mod socket;
 pub mod transport;
 
+#[cfg(feature = "std")]
+pub use error::NngError;
 pub use message::{Message, MessageBuf, ZeroCopyMessage};
+#[cfg(feature = "tower")]
+pub use socket::tower_svc::Req0Service;

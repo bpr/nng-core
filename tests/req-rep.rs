@@ -1,4 +1,4 @@
-use std::fmt::Write;
+use std::time::Duration;
 
 use nng_core::{Message, socket::reqrep0};
 
@@ -89,6 +89,136 @@ async fn req_rep_large_message() {
     request.push_back(&data);
     let reply = req.request(request).await.unwrap();
     assert_eq!(reply.body(), data_clone.as_slice());
+
+    server.await.unwrap();
+}
+
+// ── resend tests ──────────────────────────────────────────────────────────────
+
+/// Server drops the first request (no reply) and only answers the resend.
+/// Client must receive the reply from the resend.
+#[tokio::test]
+async fn req0_resend_when_first_request_dropped() {
+    let addr = free_addr().await;
+
+    let server_addr = addr.clone();
+    let server = tokio::spawn(async move {
+        let mut rep = reqrep0::Rep0::listen(&server_addr).await.unwrap();
+
+        // Receive the first request but do not reply — drop the Responder.
+        let _dropped = rep.receive().await.unwrap();
+
+        // Reply to the resend.
+        let (msg, responder) = rep.receive().await.unwrap();
+        let mut reply = Message::new();
+        reply.push_back(msg.body());
+        responder.reply(reply).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let mut req = reqrep0::Req0::dial(&addr).await.unwrap();
+    req.set_resend_time(Duration::from_millis(50));
+
+    let mut msg = Message::new();
+    msg.push_back(b"ping");
+    let reply = req.request(msg).await.unwrap();
+    assert_eq!(reply.body(), b"ping");
+
+    server.await.unwrap();
+}
+
+/// Stale replies (from resends of a prior request) must be discarded when the
+/// next `request()` call runs.
+///
+/// The gate delays the first reply until after the resend fires, guaranteeing
+/// the server produces at least one extra reply (for the resend).  The server
+/// loops until it answers `b"req2"`, handling any number of resends — so the
+/// test is robust to scheduling jitter that causes multiple resends to fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn req0_stale_reply_discarded_on_next_request() {
+    let addr = free_addr().await;
+    let addr2 = addr.clone();
+
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        let mut rep = reqrep0::Rep0::listen(&addr2).await.unwrap();
+
+        // Receive the first request; hold the reply until the gate opens so
+        // the resend fires first.
+        let (msg, resp) = rep.receive().await.unwrap();
+        gate_rx.await.unwrap();
+        let mut reply = Message::new();
+        reply.push_back(msg.body());
+        resp.reply(reply).await.unwrap();
+
+        // Reply to all subsequent messages (resends of request 1, then request 2)
+        // until the body b"req2" is answered.
+        loop {
+            let Ok((msg, resp)) = rep.receive().await else {
+                break;
+            };
+            let done = msg.body() == b"req2";
+            let mut reply = Message::new();
+            reply.push_back(msg.body());
+            let _ = resp.reply(reply).await;
+            if done {
+                break;
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let mut req = reqrep0::Req0::dial(&addr).await.unwrap();
+    req.set_resend_time(Duration::from_millis(50));
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = gate_tx.send(());
+    });
+
+    // Request 1 (ID=1): resend fires at 50 ms; gate opens at 80 ms.
+    let mut msg1 = Message::new();
+    msg1.push_back(b"req1");
+    let reply1 = req.request(msg1).await.unwrap();
+    assert_eq!(reply1.body(), b"req1");
+
+    // Request 2 (ID=2): stale replies from request 1's resends must be
+    // silently discarded; the first reply with ID=2 is accepted.
+    let mut msg2 = Message::new();
+    msg2.push_back(b"req2");
+    let reply2 = req.request(msg2).await.unwrap();
+    assert_eq!(reply2.body(), b"req2");
+
+    server.await.unwrap();
+}
+
+/// With no resend configured, request() waits indefinitely and returns the
+/// first valid reply even when the server is slow.
+#[tokio::test]
+async fn req0_no_resend_waits_for_late_reply() {
+    let addr = free_addr().await;
+
+    let server_addr = addr.clone();
+    let server = tokio::spawn(async move {
+        let mut rep = reqrep0::Rep0::listen(&server_addr).await.unwrap();
+        let (msg, responder) = rep.receive().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut reply = Message::new();
+        reply.push_back(msg.body());
+        responder.reply(reply).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let mut req = reqrep0::Req0::dial(&addr).await.unwrap();
+    // resend_time deliberately NOT set.
+    let mut msg = Message::new();
+    msg.push_back(b"slow");
+    let reply = req.request(msg).await.unwrap();
+    assert_eq!(reply.body(), b"slow");
 
     server.await.unwrap();
 }
