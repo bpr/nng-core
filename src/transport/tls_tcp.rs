@@ -1,6 +1,6 @@
 //! TLS-over-TCP stream types for [`FramedTransport`].
 //!
-//! [`TlsTcpStream`] wraps either a client-side or server-side TLS stream over
+//! `TlsTcpStream` wraps either a client-side or server-side TLS stream over
 //! TCP and implements `embedded-io-async` `Read` + `Write` so it can be used
 //! directly with [`FramedTransport`].  The SP handshake and 8-byte TCP frame
 //! format are unchanged; TLS is purely a socket-layer concern.

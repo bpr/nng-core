@@ -9,8 +9,8 @@
 //! - `tls+tcp://host:port` — TLS over TCP (requires `tls-tcp` feature)
 //! - `udp://host:port` — UDP datagram (requires `udp` feature; no SP handshake)
 //!
-//! Each socket type wraps an [`AnyTransport`], which dispatches to either
-//! [`FramedTransport`] (TCP / IPC) or [`WsTransport`] (WebSocket / TLS)
+//! Each socket type wraps an `AnyTransport`, which dispatches to either
+//! `FramedTransport` (TCP / IPC) or `WsTransport` (WebSocket / TLS)
 //! depending on the URL scheme used at construction time.
 
 use std::io;
@@ -1261,9 +1261,9 @@ pub mod bus0 {
     //! receive from any of them.  BUS is stateless at the protocol level.
     //!
     //! `recv_any` polls peers in round-robin with cooperative yielding.  It is
-    //! safe to cancel between iterations because [`FramedTransport::recv`] is
+    //! safe to cancel between iterations because `FramedTransport::recv` is
     //! cancellation-safe: any bytes already read from the stream are preserved
-    //! in the transport's internal [`RecvBuf`] and resumed on the next call.
+    //! in the transport's internal `RecvBuf` and resumed on the next call.
     //! For WebSocket peers, `WsTransport::recv` is also cancellation-safe
     //! because tungstenite reassembles frames internally before yielding.
     //!
@@ -2043,7 +2043,7 @@ pub mod reqrep0 {
     }
 }
 
-/// [`tower::Service`] adapter for [`reqrep0::Req0`].
+/// [`tower_service::Service`] adapter for [`reqrep0::Req0`].
 ///
 /// Requires the `tower` Cargo feature.
 #[cfg(feature = "tower")]

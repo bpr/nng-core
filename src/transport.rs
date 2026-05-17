@@ -155,7 +155,7 @@ impl Default for RecvBuf {
 /// machine then strips its own header fields off the front via `trim_front`.
 ///
 /// `recv` is **cancellation-safe**: partial reads are buffered in the
-/// [`RecvBuf`] stored inside the transport.  Dropping a `recv` future
+/// `RecvBuf` stored inside the transport.  Dropping a `recv` future
 /// mid-read and calling `recv` again on the same transport is safe and will
 /// produce exactly one complete message, not a corrupted one.
 pub struct FramedTransport<T> {
@@ -224,7 +224,7 @@ where
     ///
     /// This method is **cancellation-safe**: if the returned future is dropped
     /// before it resolves, any bytes already read from the stream are retained
-    /// in the transport's internal [`RecvBuf`].  The next call to `recv` picks
+    /// in the transport's internal `RecvBuf`.  The next call to `recv` picks
     /// up exactly where the cancelled call left off.
     pub async fn recv(&mut self) -> Result<Message, TransportError> {
         let needed = match self.format {
