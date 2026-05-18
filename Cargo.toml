@@ -67,3 +67,7 @@ harness = false
 [[bench]]
 name = "req0_resend"
 harness = false
+
+[[bench]]
+name = "pubsub"
+harness = false
