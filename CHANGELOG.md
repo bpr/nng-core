@@ -17,6 +17,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   receives reuse the recycled `Vec` in place when capacity allows.
   Defaults: 16 buffers, 64 KiB each, both configurable via
   `BufferPool::with_capacity`. Re-exported at the crate root.
+- **Criterion benchmark suite** (`benches/`) — three benchmark binaries:
+  `latency` (REQ/REP round-trip, Rust-only + vs nngcat), `throughput` (PUSH/PULL
+  pipeline), and `codec` (frame encode/decode micro-benchmarks). `nngcat` from
+  the system NNG package is used as the C libnng peer for the vs-C comparisons.
+- **`scripts/bench_c_vs_c.sh`** — shell script to measure C libnng (nngcat)
+  PUSH/PULL marginal per-message cost via repeated runs at different message
+  counts, for comparison against the Criterion benchmark results.
 
 ### Changed (internal, non-breaking)
 
@@ -24,6 +31,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `Message` body. The buffer is moved directly via `Message::from_parts`,
   eliminating one allocation and one full-payload memcpy per receive. The
   returned `Message` is byte-identical to before.
+
+---
+
+## [0.2.1] - 2026-05-17
+
+### Fixed
+
+- **TCP latency** — `TCP_NODELAY` is now set on all TCP connections (both dial
+  and accept). Previously, the multi-write `send` path (length header + message
+  header + body as separate `write_all` calls) interacted with Nagle's algorithm
+  and Linux's 40 ms delayed-ACK timer to produce ~80 ms per-message latency for
+  small payloads instead of the expected ~40 µs. This matches the default
+  behavior of the NNG C library.
 
 ---
 
@@ -132,6 +152,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **NNG 1.5.x IPC framing** — 9-byte header (`0x01` type byte + 8-byte BE u64
   length) correctly handled for both send and receive.
 
-[Unreleased]: https://github.com/bpr/nng-core/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bpr/nng-core/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/bpr/nng-core/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bpr/nng-core/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bpr/nng-core/releases/tag/v0.1.0

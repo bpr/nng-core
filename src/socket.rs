@@ -190,6 +190,7 @@ impl AnyListener {
         match self {
             Self::Tcp(l) => {
                 let (stream, _) = l.accept().await?;
+                stream.set_nodelay(true).map_err(NngError::from)?;
                 connect_framed(AnyStream::Tcp(TokioTcpStream(stream)), proto)
                     .await
                     .map(AnyTransport::Framed)
@@ -247,6 +248,7 @@ impl AnyListener {
         match self {
             Self::Tcp(l) => {
                 let (stream, _) = l.accept().await?;
+                stream.set_nodelay(true)?;
                 Ok(RawConn::Stream(AnyStream::Tcp(TokioTcpStream(stream))))
             }
             #[cfg(unix)]
@@ -414,6 +416,10 @@ pub(crate) async fn connect_stream(addr: &str) -> Result<AnyStream, NngError> {
     if let Some(tcp_addr) = addr.strip_prefix("tcp://") {
         TcpStream::connect(tcp_addr)
             .await
+            .and_then(|s| {
+                s.set_nodelay(true)?;
+                Ok(s)
+            })
             .map(|s| AnyStream::Tcp(TokioTcpStream(s)))
             .map_err(NngError::from)
     } else if let Some(ipc_path) = addr.strip_prefix("ipc://") {
