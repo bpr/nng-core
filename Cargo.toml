@@ -71,3 +71,7 @@ harness = false
 [[bench]]
 name = "pubsub"
 harness = false
+
+[[bench]]
+name = "large_msg"
+harness = false
