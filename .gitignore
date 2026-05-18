@@ -1,6 +1,8 @@
 /target/
 Cargo.lock
 fuzz/target/
+c_bench/push_client
+c_bench/pull_sink
 ws_nng_plan.md
 secure_websockets.md
 nngv2.md
