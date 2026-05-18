@@ -63,3 +63,7 @@ harness = false
 [[bench]]
 name = "bus0_broadcast"
 harness = false
+
+[[bench]]
+name = "req0_resend"
+harness = false

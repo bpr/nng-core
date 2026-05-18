@@ -17,12 +17,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   receives reuse the recycled `Vec` in place when capacity allows.
   Defaults: 16 buffers, 64 KiB each, both configurable via
   `BufferPool::with_capacity`. Re-exported at the crate root.
-- **Criterion benchmark suite** (`benches/`) — four benchmark binaries:
+- **Criterion benchmark suite** (`benches/`) — five benchmark binaries:
   `latency` (REQ/REP round-trip over TCP and IPC, Rust-only + vs nngcat),
   `throughput` (PUSH/PULL pipeline), `codec` (frame encode/decode
-  micro-benchmarks), and `bus0_broadcast` (broadcast throughput vs peer count:
-  2, 4, 8 peers). `nngcat` from the system NNG package is used as the C libnng
-  peer for the vs-C comparisons.
+  micro-benchmarks), `bus0_broadcast` (broadcast throughput vs peer count:
+  2, 4, 8 peers), and `req0_resend` (resend-path correctness stress test:
+  four resend deadlines from disabled down to 20 µs, below TCP RTT, with
+  per-iteration payload assertions to detect stale-reply acceptance). `nngcat`
+  from the system NNG package is used as the C libnng peer for the vs-C
+  comparisons.
 - **`scripts/bench_c_vs_c.sh`** — shell script to measure C libnng (nngcat)
   PUSH/PULL marginal per-message cost via repeated runs at different message
   counts, for comparison against the Criterion benchmark results.
