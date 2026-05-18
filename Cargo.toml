@@ -59,3 +59,7 @@ harness = false
 [[bench]]
 name = "codec"
 harness = false
+
+[[bench]]
+name = "bus0_broadcast"
+harness = false
