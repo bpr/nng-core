@@ -9,6 +9,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **`BufferPool`** and **`FramedTransport::recv_pooled`** — opt-in buffer reuse
+  for hot recv loops. Callers maintain a `BufferPool`, pass it to
+  `recv_pooled`, and return body buffers with `pool.recycle(msg)`; subsequent
+  receives reuse the recycled `Vec` in place when capacity allows.
+  Defaults: 16 buffers, 64 KiB each, both configurable via
+  `BufferPool::with_capacity`. Re-exported at the crate root.
+
+### Changed (internal, non-breaking)
+
+- `FramedTransport::recv` no longer copies the payload buffer into a fresh
+  `Message` body. The buffer is moved directly via `Message::from_parts`,
+  eliminating one allocation and one full-payload memcpy per receive. The
+  returned `Message` is byte-identical to before.
+
 ---
 
 ## [0.2.0] - 2026-05-17

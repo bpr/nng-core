@@ -20,6 +20,16 @@
 //! that type byte and aligns IPC framing with TCP. If you connect to a system
 //! NNG installed from most Linux distributions (which ship 1.5.x), use
 //! [`FrameFormat::Ipc`]; for NNG 2.x use [`FrameFormat::Tcp`].
+//!
+//! # Buffer reuse
+//!
+//! Each call to [`FramedTransport::recv`] allocates a `Vec<u8>` sized to the
+//! incoming frame. Callers that recv in a tight loop can amortize the
+//! allocation with [`BufferPool`]: take a buffer from the pool via
+//! [`FramedTransport::recv_pooled`], process the message, then return its body
+//! buffer with [`BufferPool::recycle`]. After the first frame, the pool's
+//! buffer is reused in place — `Vec::resize` is a no-op when the existing
+//! capacity already covers the new frame length.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -227,6 +237,53 @@ where
     /// in the transport's internal `RecvBuf`.  The next call to `recv` picks
     /// up exactly where the cancelled call left off.
     pub async fn recv(&mut self) -> Result<Message, TransportError> {
+        self.recv_inner(|len| vec![0u8; len]).await
+    }
+
+    /// Receive a complete message, drawing the body buffer from `pool` if one
+    /// is available.
+    ///
+    /// Semantically identical to [`recv`](Self::recv). The only difference is
+    /// the source of the body `Vec<u8>`: instead of always allocating, this
+    /// method first tries `pool.take()`. After processing the returned message,
+    /// call [`BufferPool::recycle`] to return the body buffer to the pool.
+    ///
+    /// In a steady-state loop where `recycle` puts the buffer back and the
+    /// next frame fits within the recycled buffer's capacity,
+    /// `Vec::resize` is a no-op and **no allocation occurs**.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use nng_core::BufferPool;
+    ///
+    /// let mut pool = BufferPool::new();
+    /// loop {
+    ///     let msg = transport.recv_pooled(&mut pool).await?;
+    ///     handle(msg.body());
+    ///     pool.recycle(msg);
+    /// }
+    /// ```
+    ///
+    /// See `examples/pool_consumer.rs` for a complete end-to-end program.
+    pub async fn recv_pooled(&mut self, pool: &mut BufferPool) -> Result<Message, TransportError> {
+        self.recv_inner(|len| {
+            let mut buf = pool.take();
+            buf.resize(len, 0);
+            buf
+        })
+        .await
+    }
+
+    /// Shared body of `recv` / `recv_pooled`. The `alloc_body` closure is
+    /// invoked exactly once per message, at the Len → Body phase transition.
+    /// If the future is dropped mid-body and a subsequent call resumes in the
+    /// Body phase, the closure is never invoked — `self.rx.body` already holds
+    /// the partially-filled buffer.
+    async fn recv_inner<F>(&mut self, alloc_body: F) -> Result<Message, TransportError>
+    where
+        F: FnOnce(usize) -> Vec<u8>,
+    {
         let needed = match self.format {
             FrameFormat::Tcp => 8usize,
             FrameFormat::Ipc => 9usize,
@@ -272,7 +329,7 @@ where
                 self.rx.phase = RecvPhase::Idle;
                 return Err(TransportError::FrameTooLarge(payload_len));
             }
-            self.rx.body = vec![0u8; payload_len];
+            self.rx.body = alloc_body(payload_len);
             self.rx.body_filled = 0;
             self.rx.phase = RecvPhase::Body;
         }
@@ -295,14 +352,96 @@ where
         self.rx.phase = RecvPhase::Idle;
         let payload = core::mem::replace(&mut self.rx.body, Vec::new());
 
-        let mut msg = Message::new();
-        msg.push_back(&payload);
-        Ok(msg)
+        Ok(Message::from_parts(Vec::new(), payload))
     }
 
     /// Unwrap the inner stream.
     pub fn into_inner(self) -> T {
         self.inner
+    }
+}
+
+// ── BufferPool ────────────────────────────────────────────────────────────────
+
+/// Bounded LIFO pool of body buffers for [`FramedTransport::recv_pooled`].
+///
+/// `BufferPool` recycles the `Vec<u8>` body buffer from a received [`Message`]
+/// so that the next recv can fill it in place instead of allocating fresh.
+/// Pair `recv_pooled` with [`recycle`](Self::recycle) inside a hot loop:
+///
+/// ```rust,ignore
+/// use nng_core::{BufferPool, transport::FramedTransport};
+///
+/// let mut pool = BufferPool::new();
+/// loop {
+///     let msg = transport.recv_pooled(&mut pool).await?;
+///     // ... process msg ...
+///     pool.recycle(msg);
+/// }
+/// ```
+///
+/// The pool is bounded by two limits, configurable via
+/// [`with_capacity`](Self::with_capacity):
+///
+/// - `max_bufs` — number of buffers held simultaneously (defaults to 16).
+/// - `max_buf_bytes` — buffers whose `capacity()` exceeds this are dropped on
+///   `recycle` instead of being stored, so outlier large frames do not bloat
+///   the pool (defaults to 64 KiB).
+///
+/// `BufferPool` is not internally synchronized; share a pool across tasks via
+/// `Arc<Mutex<BufferPool>>` if needed, or use one pool per receiving task.
+pub struct BufferPool {
+    bufs: Vec<Vec<u8>>,
+    max_bufs: usize,
+    max_buf_bytes: usize,
+}
+
+impl BufferPool {
+    /// Create a pool with defaults: at most 16 buffers, each ≤ 64 KiB.
+    pub fn new() -> Self {
+        Self::with_capacity(16, 64 * 1024)
+    }
+
+    /// Create a pool with explicit caps on buffer count and per-buffer size.
+    pub fn with_capacity(max_bufs: usize, max_buf_bytes: usize) -> Self {
+        Self {
+            bufs: Vec::with_capacity(max_bufs),
+            max_bufs,
+            max_buf_bytes,
+        }
+    }
+
+    /// Return a message's body buffer to the pool. The header is dropped.
+    ///
+    /// Buffers are dropped (not stored) when the pool is already at capacity
+    /// or when the body's `capacity()` exceeds `max_buf_bytes`.
+    pub fn recycle(&mut self, msg: Message) {
+        let (_header, body) = msg.into_parts();
+        if self.bufs.len() < self.max_bufs && body.capacity() <= self.max_buf_bytes {
+            self.bufs.push(body);
+        }
+    }
+
+    /// Number of buffers currently held in the pool.
+    pub fn len(&self) -> usize {
+        self.bufs.len()
+    }
+
+    /// `true` when the pool holds no buffers.
+    pub fn is_empty(&self) -> bool {
+        self.bufs.is_empty()
+    }
+
+    /// Pop a buffer from the pool, or return an empty `Vec` if the pool is
+    /// empty. Used by [`FramedTransport::recv_pooled`].
+    fn take(&mut self) -> Vec<u8> {
+        self.bufs.pop().unwrap_or_default()
+    }
+}
+
+impl Default for BufferPool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

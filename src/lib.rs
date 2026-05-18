@@ -62,3 +62,4 @@ pub use error::NngError;
 pub use message::{Message, MessageBuf, ZeroCopyMessage};
 #[cfg(feature = "tower")]
 pub use socket::tower_svc::Req0Service;
+pub use transport::BufferPool;
