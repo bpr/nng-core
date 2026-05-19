@@ -9,6 +9,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.2]
+
 ### Added
 
 - **QUIC transport** (`--features quic`) — QUIC via `quinn` 0.11 + `rustls` 0.23.
