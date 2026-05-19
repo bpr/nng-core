@@ -546,6 +546,9 @@ pub mod tls_tcp;
 #[cfg(feature = "quic")]
 pub(crate) mod quic;
 
+#[cfg(feature = "vsock")]
+pub(crate) mod vsock;
+
 #[cfg(feature = "udp")]
 pub mod udp;
 #[cfg(feature = "udp")]

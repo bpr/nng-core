@@ -7,6 +7,8 @@
 //! - `ws://host:port[/path]` — WebSocket (requires `ws` feature)
 //! - `wss://host:port[/path]` — Secure WebSocket / TLS (requires `wss` feature)
 //! - `tls+tcp://host:port` — TLS over TCP (requires `tls-tcp` feature)
+//! - `quic://host:port` — QUIC / TLS 1.3 (requires `quic` feature)
+//! - `vsock://CID:port` — VSOCK VM transport, Linux only (requires `vsock` feature)
 //! - `udp://host:port` — UDP datagram (requires `udp` feature; no SP handshake)
 //!
 //! Each socket type wraps an `AnyTransport`, which dispatches to either
@@ -47,6 +49,11 @@ use crate::transport::udp::UdpTransport;
 
 #[cfg(feature = "quic")]
 use crate::transport::quic::{self as quic_mod, QuicStream};
+
+#[cfg(feature = "vsock")]
+use crate::transport::vsock::{self as vsock_mod, TokioVsockStream};
+#[cfg(feature = "vsock")]
+use tokio_vsock::VsockListener;
 
 // ── AnyTransport: FramedTransport or WsTransport ─────────────────────────────
 
@@ -113,6 +120,9 @@ pub(crate) enum AnyStream {
     /// QUIC bidirectional stream: 8-byte frame header, TLS 1.3 socket layer.
     #[cfg(feature = "quic")]
     Quic(QuicStream),
+    /// VSOCK stream: 8-byte frame header, Linux AF_VSOCK socket layer.
+    #[cfg(feature = "vsock")]
+    Vsock(TokioVsockStream),
 }
 
 impl ErrorType for AnyStream {
@@ -129,6 +139,8 @@ impl EioRead for AnyStream {
             Self::TlsTcp(s) => EioRead::read(s, buf).await,
             #[cfg(feature = "quic")]
             Self::Quic(s) => EioRead::read(s, buf).await,
+            #[cfg(feature = "vsock")]
+            Self::Vsock(s) => EioRead::read(s, buf).await,
         }
     }
 }
@@ -143,6 +155,8 @@ impl EioWrite for AnyStream {
             Self::TlsTcp(s) => EioWrite::write(s, buf).await,
             #[cfg(feature = "quic")]
             Self::Quic(s) => EioWrite::write(s, buf).await,
+            #[cfg(feature = "vsock")]
+            Self::Vsock(s) => EioWrite::write(s, buf).await,
         }
     }
 
@@ -155,6 +169,8 @@ impl EioWrite for AnyStream {
             Self::TlsTcp(s) => EioWrite::flush(s).await,
             #[cfg(feature = "quic")]
             Self::Quic(s) => EioWrite::flush(s).await,
+            #[cfg(feature = "vsock")]
+            Self::Vsock(s) => EioWrite::flush(s).await,
         }
     }
 }
@@ -171,6 +187,8 @@ impl AnyStream {
             Self::TlsTcp(_) => FrameFormat::Tcp,
             #[cfg(feature = "quic")]
             Self::Quic(_) => FrameFormat::Tcp,
+            #[cfg(feature = "vsock")]
+            Self::Vsock(_) => FrameFormat::Tcp,
         }
     }
 }
@@ -195,6 +213,9 @@ pub(crate) enum AnyListener {
     /// QUIC endpoint: TLS 1.3, one bidirectional stream per SP connection.
     #[cfg(feature = "quic")]
     Quic(quinn::Endpoint),
+    /// VSOCK listener: Linux AF_VSOCK, 8-byte TCP frame header.
+    #[cfg(feature = "vsock")]
+    Vsock(VsockListener),
 }
 
 impl AnyListener {
@@ -262,6 +283,14 @@ impl AnyListener {
                     .map(AnyTransport::Framed)
                     .map_err(NngError::from)
             }
+            #[cfg(feature = "vsock")]
+            Self::Vsock(l) => {
+                let (stream, _) = l.accept().await?;
+                connect_framed(AnyStream::Vsock(TokioVsockStream(stream)), proto)
+                    .await
+                    .map(AnyTransport::Framed)
+                    .map_err(NngError::from)
+            }
         }
     }
 
@@ -306,6 +335,11 @@ impl AnyListener {
                 "QUIC listeners do not support non-blocking accept; \
                  use accept_as_transport instead",
             )),
+            #[cfg(feature = "vsock")]
+            Self::Vsock(l) => {
+                let (stream, _) = l.accept().await?;
+                Ok(RawConn::Stream(AnyStream::Vsock(TokioVsockStream(stream))))
+            }
         }
     }
 }
@@ -398,6 +432,18 @@ pub(crate) async fn bind_listener(addr: &str) -> Result<AnyListener, NngError> {
         Err(NngError::ProtocolViolation(
             "quic:// requires listen_quic — use listen_quic(addr, cert_pem, key_pem)".into(),
         ))
+    } else if let Some(vsock_addr) = addr.strip_prefix("vsock://") {
+        #[cfg(feature = "vsock")]
+        {
+            return vsock_mod::bind_vsock_listener(vsock_addr)
+                .map(AnyListener::Vsock)
+                .map_err(NngError::from);
+        }
+        #[cfg(not(feature = "vsock"))]
+        {
+            let _ = vsock_addr;
+            return Err(NngError::FeatureNotEnabled("vsock"));
+        }
     } else {
         Err(NngError::UnsupportedScheme(addr.to_owned()))
     }
@@ -503,6 +549,19 @@ pub(crate) async fn connect_stream(addr: &str) -> Result<AnyStream, NngError> {
         {
             let _ = tls_addr;
             return Err(NngError::FeatureNotEnabled("tls-tcp"));
+        }
+    } else if let Some(vsock_addr) = addr.strip_prefix("vsock://") {
+        #[cfg(feature = "vsock")]
+        {
+            return vsock_mod::connect_vsock_stream(vsock_addr)
+                .await
+                .map(|s| AnyStream::Vsock(TokioVsockStream(s)))
+                .map_err(NngError::from);
+        }
+        #[cfg(not(feature = "vsock"))]
+        {
+            let _ = vsock_addr;
+            return Err(NngError::FeatureNotEnabled("vsock"));
         }
     } else {
         Err(NngError::UnsupportedScheme(addr.to_owned()))

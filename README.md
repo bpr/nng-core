@@ -121,6 +121,7 @@ See `examples/` for complete, runnable examples of every protocol.
 |---|---|---|
 | `std` | yes | Enables tokio TCP transport and the high-level socket API |
 | `quic` | no | QUIC transport via `quinn` + `rustls` (TLS 1.3 built-in). Adds `listen_quic` / `dial_quic` to all socket types; `dial("quic://...")` uses the system's native root store |
+| `vsock` | no | VSOCK VM transport, Linux only. Adds `listen("vsock://any:port")` / `dial("vsock://2:port")` to all socket types |
 | `tls-tcp` | no | TLS over TCP via `rustls`. Adds `listen_tls_tcp` / `dial_tls_tcp` |
 | `ws` | no | WebSocket transport via `tokio-tungstenite`. Adds `dial("ws://...")` |
 | `wss` | no | WebSocket over TLS. Adds `listen_tls` / `dial("wss://...")` |

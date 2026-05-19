@@ -19,6 +19,7 @@ ws      = ["std", "dep:tokio-tungstenite", "dep:futures-util"]
 wss     = ["ws", "tokio-tungstenite/rustls-tls-native-roots", "dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
 tls-tcp = ["std", "dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs"]
 quic    = ["std", "dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs"]
+vsock   = ["std", "dep:tokio-vsock"]
 udp     = ["std"]
 tower   = ["std", "dep:tower-service"]
 streams = ["std", "dep:futures-core", "dep:futures-sink", "dep:futures-util"]
@@ -35,6 +36,7 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 rustls-pemfile = { version = "2", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 quinn = { version = "0.11", optional = true }
+tokio-vsock = { version = "0.7", optional = true }
 tower-service = { version = "0.3", optional = true }
 
 [lints.rust]

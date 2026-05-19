@@ -9,6 +9,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **VSOCK transport** (`--features vsock`, Linux only) — AF_VSOCK via `tokio-vsock`
+  0.7.  Enables SP messaging between a VM guest and its host (or between two
+  VMs on the same hypervisor) without a network stack.  Uses the TCP frame
+  format (8-byte length header) and the standard SP handshake.  URL scheme:
+  `vsock://CID:port`.  The CID component accepts numeric values or the aliases
+  `any` (wildcard listener), `host` (CID 2), and `local` (CID 1, loopback).
+  All typed sockets support the scheme via the existing `listen` / `dial`
+  constructors — no dedicated `listen_vsock` / `dial_vsock` methods are needed.
+  Loopback testing (guest-to-guest on the same VM) requires the `vsock_loopback`
+  kernel module.
+
 ## [0.2.2]
 
 ### Added
