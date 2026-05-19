@@ -1922,10 +1922,14 @@ pub mod pipeline0 {
     /// has data available first.
     ///
     /// Each connected sender runs in its own tokio task so `recv` is never
-    /// cancelled mid-read.
+    /// cancelled mid-read.  Dropping `Pull0Fan` cancels all background tasks
+    /// promptly, even if their peers are idle.
     pub struct Pull0Fan {
         rx: tokio::sync::mpsc::Receiver<Result<Message, NngError>>,
         n: usize,
+        /// Dropping this sender closes the watch channel, which unblocks every
+        /// background task's `cancel.changed()` call and causes it to exit.
+        _shutdown: tokio::sync::watch::Sender<()>,
     }
 
     impl Pull0Fan {
@@ -1934,29 +1938,42 @@ pub mod pipeline0 {
         pub async fn listen_and_accept(addr: &str, n: usize) -> Result<Self, NngError> {
             let listener = bind_listener(addr).await?;
             let (tx, rx) = tokio::sync::mpsc::channel(n * 4);
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
             let mut count = 0;
             while count < n {
                 if let Ok(mut transport) = listener.accept_as_transport(ProtocolId::PULL0).await {
                     let tx2 = tx.clone();
+                    let mut cancel = shutdown_rx.clone();
                     tokio::spawn(async move {
                         loop {
-                            match transport.recv().await {
-                                Ok(msg) => {
-                                    if tx2.send(Ok(msg)).await.is_err() {
-                                        break;
+                            tokio::select! {
+                                result = transport.recv() => {
+                                    match result {
+                                        Ok(msg) => {
+                                            if tx2.send(Ok(msg)).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = tx2.send(Err(e)).await;
+                                            break;
+                                        }
                                     }
                                 }
-                                Err(e) => {
-                                    let _ = tx2.send(Err(e)).await;
-                                    break;
-                                }
+                                // Fires (with Err) when the Pull0Fan is dropped and
+                                // the shutdown_tx Sender is closed.
+                                _ = cancel.changed() => break,
                             }
                         }
                     });
                     count += 1;
                 }
             }
-            Ok(Self { rx, n })
+            Ok(Self {
+                rx,
+                n,
+                _shutdown: shutdown_tx,
+            })
         }
 
         /// Receive the next message from any connected sender.
