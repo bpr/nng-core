@@ -73,6 +73,46 @@ sub.subscribe_to(b"news:");          // only receive messages starting with "new
 let msg = sub.next().await?;
 ```
 
+### QUIC (requires `--features quic`)
+
+```toml
+# Cargo.toml
+nng-core = { version = "...", features = ["quic"] }
+rustls = "0.23"   # only needed when constructing a custom ClientConfig
+```
+
+```rust
+use nng_core::{Message, socket::reqrep0};
+use std::{path::Path, sync::Arc};
+
+// Server — cert and key are PEM files
+let mut rep = reqrep0::Rep0::listen_quic(
+    "quic://0.0.0.0:5555",
+    Path::new("server.crt"),
+    Path::new("server.key"),
+).await?;
+let (request, responder) = rep.receive().await?;
+let mut reply = Message::new();
+reply.push_back(b"pong");
+responder.reply(reply).await?;
+
+// Client with CA-signed certificate — no rustls dependency needed
+let mut req = reqrep0::Req0::dial("quic://myserver.example.com:5555").await?;
+
+// Client with self-signed certificate — supply a custom rustls::ClientConfig
+let mut root_store = rustls::RootCertStore::empty();
+root_store.add(cert_der).unwrap();
+let config = Arc::new(
+    rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth(),
+);
+let mut req = reqrep0::Req0::dial_quic("quic://127.0.0.1:5555", config).await?;
+let reply = req.request(msg).await?;
+```
+
+See `examples/quic_reqrep.rs` for a complete, self-contained runnable example.
+
 See `examples/` for complete, runnable examples of every protocol.
 
 ## Features
@@ -80,6 +120,13 @@ See `examples/` for complete, runnable examples of every protocol.
 | Feature | Default | Description |
 |---|---|---|
 | `std` | yes | Enables tokio TCP transport and the high-level socket API |
+| `quic` | no | QUIC transport via `quinn` + `rustls` (TLS 1.3 built-in). Adds `listen_quic` / `dial_quic` to all socket types; `dial("quic://...")` uses the system's native root store |
+| `tls-tcp` | no | TLS over TCP via `rustls`. Adds `listen_tls_tcp` / `dial_tls_tcp` |
+| `ws` | no | WebSocket transport via `tokio-tungstenite`. Adds `dial("ws://...")` |
+| `wss` | no | WebSocket over TLS. Adds `listen_tls` / `dial("wss://...")` |
+| `udp` | no | UDP transport. Adds `dial("udp://...")` — no SP handshake, datagram-only |
+| `streams` | no | `futures_core::Stream` / `futures_sink::Sink` adapters for socket types |
+| `tower` | no | `tower-service` integration |
 
 With `--no-default-features`, only `codec`, `message`, and `transport` (generic over any `embedded-io-async` stream) are compiled. The `protocols/` state machines are always available.
 
@@ -388,3 +435,20 @@ cargo run --example wq_client
 ```
 
 The reply payloads (`worker-N:job-M:done`) confirm which worker handled each job. Worker index in the reply should cycle 0→1→2→0→… across the 8 client requests.
+
+---
+
+#### QUIC REQ/REP — `quic_reqrep`
+
+Port 15000. Demonstrates REQ/REP over QUIC in a single process. Generates a
+self-signed TLS certificate at startup, runs server and client with
+`tokio::spawn`, and exchanges five requests.
+
+```bash
+cargo run --example quic_reqrep --features quic
+```
+
+`Rep0::listen_quic` binds a QUIC endpoint; `Req0::dial_quic` connects with a
+custom `rustls::ClientConfig` that trusts the self-signed certificate. For
+production use with CA-signed certificates replace `dial_quic` with
+`Req0::dial("quic://host:port")`, which uses the system's native root store.

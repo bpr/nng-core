@@ -45,6 +45,9 @@ use crate::transport::tls_tcp::{
 #[cfg(feature = "udp")]
 use crate::transport::udp::UdpTransport;
 
+#[cfg(feature = "quic")]
+use crate::transport::quic::{self as quic_mod, QuicStream};
+
 // ── AnyTransport: FramedTransport or WsTransport ─────────────────────────────
 
 pub(crate) enum AnyTransport {
@@ -107,6 +110,9 @@ pub(crate) enum AnyStream {
     /// TLS over TCP: 8-byte frame header, TLS socket layer.
     #[cfg(feature = "tls-tcp")]
     TlsTcp(TlsTcpStream),
+    /// QUIC bidirectional stream: 8-byte frame header, TLS 1.3 socket layer.
+    #[cfg(feature = "quic")]
+    Quic(QuicStream),
 }
 
 impl ErrorType for AnyStream {
@@ -121,6 +127,8 @@ impl EioRead for AnyStream {
             Self::Ipc(s) | Self::Ipc2(s) => EioRead::read(s, buf).await,
             #[cfg(feature = "tls-tcp")]
             Self::TlsTcp(s) => EioRead::read(s, buf).await,
+            #[cfg(feature = "quic")]
+            Self::Quic(s) => EioRead::read(s, buf).await,
         }
     }
 }
@@ -133,6 +141,8 @@ impl EioWrite for AnyStream {
             Self::Ipc(s) | Self::Ipc2(s) => EioWrite::write(s, buf).await,
             #[cfg(feature = "tls-tcp")]
             Self::TlsTcp(s) => EioWrite::write(s, buf).await,
+            #[cfg(feature = "quic")]
+            Self::Quic(s) => EioWrite::write(s, buf).await,
         }
     }
 
@@ -143,6 +153,8 @@ impl EioWrite for AnyStream {
             Self::Ipc(s) | Self::Ipc2(s) => EioWrite::flush(s).await,
             #[cfg(feature = "tls-tcp")]
             Self::TlsTcp(s) => EioWrite::flush(s).await,
+            #[cfg(feature = "quic")]
+            Self::Quic(s) => EioWrite::flush(s).await,
         }
     }
 }
@@ -157,6 +169,8 @@ impl AnyStream {
             Self::Ipc2(_) => FrameFormat::Tcp,
             #[cfg(feature = "tls-tcp")]
             Self::TlsTcp(_) => FrameFormat::Tcp,
+            #[cfg(feature = "quic")]
+            Self::Quic(_) => FrameFormat::Tcp,
         }
     }
 }
@@ -178,6 +192,9 @@ pub(crate) enum AnyListener {
     /// TLS over TCP: 8-byte frame header, TLS socket layer.
     #[cfg(feature = "tls-tcp")]
     TlsTcp(TcpListener, tokio_rustls::TlsAcceptor),
+    /// QUIC endpoint: TLS 1.3, one bidirectional stream per SP connection.
+    #[cfg(feature = "quic")]
+    Quic(quinn::Endpoint),
 }
 
 impl AnyListener {
@@ -237,6 +254,14 @@ impl AnyListener {
                     .map(AnyTransport::Framed)
                     .map_err(NngError::from)
             }
+            #[cfg(feature = "quic")]
+            Self::Quic(ep) => {
+                let qs = quic_mod::server_stream(ep).await.map_err(NngError::from)?;
+                connect_framed(AnyStream::Quic(qs), proto)
+                    .await
+                    .map(AnyTransport::Framed)
+                    .map_err(NngError::from)
+            }
         }
     }
 
@@ -276,6 +301,11 @@ impl AnyListener {
                 let (tcp, _) = l.accept().await?;
                 Ok(RawConn::TlsTcp(tcp, acceptor.clone()))
             }
+            #[cfg(feature = "quic")]
+            Self::Quic(_) => Err(io::Error::other(
+                "QUIC listeners do not support non-blocking accept; \
+                 use accept_as_transport instead",
+            )),
         }
     }
 }
@@ -364,9 +394,45 @@ pub(crate) async fn bind_listener(addr: &str) -> Result<AnyListener, NngError> {
         Err(NngError::UnsupportedScheme(
             "udp:// is not supported for multi-connection sockets".into(),
         ))
+    } else if addr.starts_with("quic://") {
+        Err(NngError::ProtocolViolation(
+            "quic:// requires listen_quic — use listen_quic(addr, cert_pem, key_pem)".into(),
+        ))
     } else {
         Err(NngError::UnsupportedScheme(addr.to_owned()))
     }
+}
+
+/// Bind a `quic://` listener endpoint.
+///
+/// `addr` must start with `quic://` followed by a `host:port` that can be
+/// parsed as a [`SocketAddr`].  `cert_pem` and `key_pem` are paths to
+/// PEM-encoded certificate chain and private key files.
+///
+/// The QUIC endpoint is bound synchronously (no async, just a UDP socket
+/// bind); the first connection is not awaited here.
+///
+/// [`SocketAddr`]: std::net::SocketAddr
+#[cfg(feature = "quic")]
+pub(crate) async fn bind_listener_quic(
+    addr: &str,
+    cert_pem: &std::path::Path,
+    key_pem: &std::path::Path,
+) -> io::Result<AnyListener> {
+    let host_port = addr
+        .strip_prefix("quic://")
+        .ok_or_else(|| io::Error::other("bind_listener_quic requires a quic:// URL"))?
+        .split('/')
+        .next()
+        .unwrap_or(addr);
+    let socket_addr = tokio::net::lookup_host(host_port)
+        .await?
+        .next()
+        .ok_or_else(|| {
+            io::Error::other(format!("could not resolve QUIC bind address: {host_port}"))
+        })?;
+    let endpoint = quic_mod::build_server_endpoint(socket_addr, cert_pem, key_pem)?;
+    Ok(AnyListener::Quic(endpoint))
 }
 
 /// Bind a `tls+tcp://` listener.
@@ -465,11 +531,52 @@ pub(crate) async fn connect_transport(
             .map(AnyTransport::Ws)
             .map_err(ws_err_to_nng);
     }
+    #[cfg(feature = "quic")]
+    if let Some(quic_addr) = addr.strip_prefix("quic://") {
+        let stream = connect_quic_stream(quic_addr)
+            .await
+            .map_err(NngError::from)?;
+        return connect_framed(stream, proto)
+            .await
+            .map(AnyTransport::Framed)
+            .map_err(NngError::from);
+    }
     let stream = connect_stream(addr).await?;
     connect_framed(stream, proto)
         .await
         .map(AnyTransport::Framed)
         .map_err(NngError::from)
+}
+
+/// Dial a `quic://` server using the platform's native root certificate store.
+///
+/// Suitable for servers with certificates signed by a public CA.  For
+/// self-signed certificates (e.g. in tests), use [`Socket::dial_quic`] which
+/// accepts a custom [`rustls::ClientConfig`].
+#[cfg(feature = "quic")]
+async fn connect_quic_stream(host_port: &str) -> io::Result<AnyStream> {
+    let client_config = quic_mod::build_native_roots_client_config()?;
+    connect_quic_stream_with(host_port, client_config).await
+}
+
+/// Dial a `quic://host:port` with a caller-supplied quinn client config.
+///
+/// Resolves the host, binds an ephemeral UDP socket, connects, and opens a
+/// bidirectional QUIC stream.  Returns the stream wrapped as `AnyStream::Quic`.
+#[cfg(feature = "quic")]
+pub(crate) async fn connect_quic_stream_with(
+    host_port: &str,
+    client_config: quinn::ClientConfig,
+) -> io::Result<AnyStream> {
+    let addr = host_port.split('/').next().unwrap_or(host_port);
+    let peer = tokio::net::lookup_host(addr)
+        .await?
+        .next()
+        .ok_or_else(|| io::Error::other(format!("could not resolve QUIC address: {addr}")))?;
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let endpoint = quic_mod::build_client_endpoint(peer, client_config)?;
+    let qs = quic_mod::client_stream(endpoint, peer, host).await?;
+    Ok(AnyStream::Quic(qs))
 }
 
 pub(crate) async fn connect_framed(
@@ -732,6 +839,55 @@ impl<P> Socket<P> {
         })?;
         let connector = tokio_rustls::TlsConnector::from(client_config);
         let stream = connect_tls_tcp_stream_with(host_port, connector).await?;
+        connect_framed(stream, proto)
+            .await
+            .map(|t| Self::new(AnyTransport::Framed(t), proto))
+            .map_err(NngError::from)
+    }
+
+    /// Bind a `quic://` listener endpoint and wait for the first connection.
+    ///
+    /// Loads the server certificate and private key from PEM files and binds a
+    /// UDP socket at `addr` (a `quic://host:port` URL; both hostname and IP
+    /// address forms are accepted).  Waits for the first QUIC connection, then
+    /// runs the SP framing handshake.
+    #[cfg(feature = "quic")]
+    pub async fn listen_quic(
+        addr: &str,
+        proto: ProtocolId,
+        cert_pem: &std::path::Path,
+        key_pem: &std::path::Path,
+    ) -> Result<Self, NngError> {
+        let listener = bind_listener_quic(addr, cert_pem, key_pem)
+            .await
+            .map_err(NngError::from)?;
+        let transport = listener.accept_as_transport(proto).await?;
+        Ok(Self::new(transport, proto))
+    }
+
+    /// Dial a `quic://` server with a custom `rustls::ClientConfig`.
+    ///
+    /// Use this when the server presents a self-signed certificate (e.g. in
+    /// tests).  For production servers with public CA certificates, use
+    /// [`dial`](Self::dial) with a `quic://` URL, which uses the system's
+    /// native root certificate store.
+    ///
+    /// The `"nng/1"` ALPN identifier is added to `client_config` automatically
+    /// if not already present.
+    #[cfg(feature = "quic")]
+    pub async fn dial_quic(
+        addr: &str,
+        proto: ProtocolId,
+        client_config: std::sync::Arc<rustls::ClientConfig>,
+    ) -> Result<Self, NngError> {
+        let host_port = addr
+            .strip_prefix("quic://")
+            .ok_or_else(|| NngError::Io(io::Error::other("dial_quic requires a quic:// URL")))?;
+        let quinn_config =
+            quic_mod::build_custom_client_config(client_config).map_err(NngError::from)?;
+        let stream = connect_quic_stream_with(host_port, quinn_config)
+            .await
+            .map_err(NngError::from)?;
         connect_framed(stream, proto)
             .await
             .map(|t| Self::new(AnyTransport::Framed(t), proto))
@@ -1467,6 +1623,38 @@ pub mod pipeline0 {
                 .map(Self)
         }
 
+        /// Bind a QUIC endpoint and wait for the first pull connection.
+        ///
+        /// `addr` must be a `quic://host:port` URL. `cert_pem` and `key_pem`
+        /// are paths to the server's PEM certificate and private key.
+        /// Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn listen_quic(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> Result<Self, NngError> {
+            Socket::listen_quic(addr, ProtocolId::PUSH0, cert_pem, key_pem)
+                .await
+                .map(Self)
+        }
+
+        /// Dial a QUIC pull server with a custom TLS client configuration.
+        ///
+        /// `addr` must be a `quic://host:port` URL. Use this when connecting
+        /// to a server with a self-signed certificate; for CA-signed
+        /// certificates use [`dial`](Self::dial) with a `quic://` URL instead.
+        /// Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn dial_quic(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> Result<Self, NngError> {
+            Socket::dial_quic(addr, ProtocolId::PUSH0, client_config)
+                .await
+                .map(Self)
+        }
+
         pub async fn dial(addr: &str) -> Result<Self, NngError> {
             Socket::dial(addr, ProtocolId::PUSH0).await.map(Self)
         }
@@ -1548,6 +1736,38 @@ pub mod pipeline0 {
             client_config: std::sync::Arc<rustls::ClientConfig>,
         ) -> Result<Self, NngError> {
             Socket::dial_tls_tcp(addr, ProtocolId::PULL0, client_config)
+                .await
+                .map(Self)
+        }
+
+        /// Bind a QUIC endpoint and wait for the first push connection.
+        ///
+        /// `addr` must be a `quic://host:port` URL. `cert_pem` and `key_pem`
+        /// are paths to the server's PEM certificate and private key.
+        /// Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn listen_quic(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> Result<Self, NngError> {
+            Socket::listen_quic(addr, ProtocolId::PULL0, cert_pem, key_pem)
+                .await
+                .map(Self)
+        }
+
+        /// Dial a QUIC push server with a custom TLS client configuration.
+        ///
+        /// `addr` must be a `quic://host:port` URL. Use this when connecting
+        /// to a server with a self-signed certificate; for CA-signed
+        /// certificates use [`dial`](Self::dial) with a `quic://` URL instead.
+        /// Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn dial_quic(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> Result<Self, NngError> {
+            Socket::dial_quic(addr, ProtocolId::PULL0, client_config)
                 .await
                 .map(Self)
         }
@@ -1786,6 +2006,38 @@ pub mod pair0 {
                 .map(Self)
         }
 
+        /// Bind a QUIC endpoint and wait for the peer connection.
+        ///
+        /// `addr` must be a `quic://host:port` URL. `cert_pem` and `key_pem`
+        /// are paths to the server's PEM certificate and private key.
+        /// Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn listen_quic(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> Result<Self, NngError> {
+            Socket::listen_quic(addr, ProtocolId::PAIR0, cert_pem, key_pem)
+                .await
+                .map(Self)
+        }
+
+        /// Dial a QUIC pair peer with a custom TLS client configuration.
+        ///
+        /// `addr` must be a `quic://host:port` URL. Use this when connecting
+        /// to a peer with a self-signed certificate; for CA-signed
+        /// certificates use [`dial`](Self::dial) with a `quic://` URL instead.
+        /// Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn dial_quic(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> Result<Self, NngError> {
+            Socket::dial_quic(addr, ProtocolId::PAIR0, client_config)
+                .await
+                .map(Self)
+        }
+
         pub async fn dial(addr: &str) -> Result<Self, NngError> {
             Socket::dial(addr, ProtocolId::PAIR0).await.map(Self)
         }
@@ -1925,6 +2177,22 @@ pub mod reqrep0 {
                 .map(Self::from_socket)
         }
 
+        /// Dial a QUIC reply server with a custom TLS client configuration.
+        ///
+        /// `addr` must be a `quic://host:port` URL. Use this when connecting
+        /// to a server with a self-signed certificate; for CA-signed
+        /// certificates use [`dial`](Self::dial) with a `quic://` URL instead.
+        /// Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn dial_quic(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> Result<Self, NngError> {
+            Socket::dial_quic(addr, ProtocolId::REQ0, client_config)
+                .await
+                .map(Self::from_socket)
+        }
+
         /// Set the resend interval.
         ///
         /// When set, [`request`](Self::request) retransmits the request after
@@ -2023,6 +2291,25 @@ pub mod reqrep0 {
             key_pem: &std::path::Path,
         ) -> Result<Self, NngError> {
             Socket::listen_tls_tcp(addr, ProtocolId::REP0, cert_pem, key_pem)
+                .await
+                .map(|s| Self {
+                    inner: s,
+                    state: Rep0State::new(),
+                })
+        }
+
+        /// Bind a QUIC endpoint and wait for the first requester connection.
+        ///
+        /// `addr` must be a `quic://host:port` URL. `cert_pem` and `key_pem`
+        /// are paths to the server's PEM certificate and private key.
+        /// Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn listen_quic(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> Result<Self, NngError> {
+            Socket::listen_quic(addr, ProtocolId::REP0, cert_pem, key_pem)
                 .await
                 .map(|s| Self {
                     inner: s,

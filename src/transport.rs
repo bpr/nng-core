@@ -303,7 +303,7 @@ where
                     .inner
                     .read(&mut self.rx.len_buf[filled..needed])
                     .await
-                    .map_err(|_| TransportError::Io)?;
+                    .map_err(|_e| TransportError::Io)?;
                 if n == 0 {
                     return Err(TransportError::Closed);
                 }
@@ -341,7 +341,7 @@ where
                 .inner
                 .read(&mut self.rx.body[filled..])
                 .await
-                .map_err(|_| TransportError::Io)?;
+                .map_err(|_e| TransportError::Io)?;
             if n == 0 {
                 return Err(TransportError::Closed);
             }
@@ -453,7 +453,7 @@ async fn write_all<T: Write>(w: &mut T, buf: &[u8]) -> Result<(), TransportError
         match w.write(&buf[written..]).await {
             Ok(0) => return Err(TransportError::Closed),
             Ok(n) => written += n,
-            Err(_) => return Err(TransportError::Io),
+            Err(_e) => return Err(TransportError::Io),
         }
     }
     Ok(())
@@ -465,7 +465,7 @@ async fn read_exact<T: Read>(r: &mut T, buf: &mut [u8]) -> Result<(), TransportE
         match r.read(&mut buf[read..]).await {
             Ok(0) => return Err(TransportError::Closed),
             Ok(n) => read += n,
-            Err(_) => return Err(TransportError::Io),
+            Err(_e) => return Err(TransportError::Io),
         }
     }
     Ok(())
@@ -542,6 +542,9 @@ pub use ws::{WsError, WsTransport};
 
 #[cfg(feature = "tls-tcp")]
 pub mod tls_tcp;
+
+#[cfg(feature = "quic")]
+pub(crate) mod quic;
 
 #[cfg(feature = "udp")]
 pub mod udp;

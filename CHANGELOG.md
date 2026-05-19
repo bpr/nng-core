@@ -11,6 +11,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **QUIC transport** (`--features quic`) — QUIC via `quinn` 0.11 + `rustls` 0.23.
+  Each SP connection maps to one QUIC connection with a single bidirectional
+  stream; the SP handshake and 8-byte TCP frame format run over that stream
+  unchanged. All typed sockets that support TCP TLS also support QUIC:
+  `Push0::listen_quic`/`dial_quic`, `Pull0::listen_quic`/`dial_quic`,
+  `Pair0::listen_quic`/`dial_quic`, `Rep0::listen_quic`, `Req0::dial_quic`.
+  Server sockets take PEM cert/key paths; client sockets take a
+  `Arc<rustls::ClientConfig>` (use `quic::build_custom_client_config` to wrap
+  it with the `"nng/1"` ALPN identifier). URL scheme: `quic://host:port`.
 - **`BufferPool`** and **`FramedTransport::recv_pooled`** — opt-in buffer reuse
   for hot recv loops. Callers maintain a `BufferPool`, pass it to
   `recv_pooled`, and return body buffers with `pool.recycle(msg)`; subsequent
