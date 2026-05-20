@@ -117,6 +117,51 @@ See `examples/` for complete, runnable examples of every protocol.
 
 ## Features
 
+### Transport support
+
+The table compares nng-core against libnng (the reference C implementation) and
+mangos (the reference Go implementation). libnng v2 is currently in alpha.
+
+| Transport | Scheme | nng-core | libnng 1.5 | libnng 2 | mangos |
+|---|---|:---:|:---:|:---:|:---:|
+| TCP | `tcp://` | ✓ | ✓ | ✓ | ✓ |
+| IPC — NNG 1.5 wire | `ipc://` | ✓ | ✓ | — | ✓ |
+| IPC — NNG 2 wire | `ipc://` / `ipc2://` | ✓ (as `ipc2://`) | — | ✓ | — |
+| TLS over TCP | `tls+tcp://` | ✓ | ✓ | ✓ | ✓ |
+| WebSocket | `ws://` | ✓ | ✓ | ✓ | ✓ |
+| WebSocket over TLS | `wss://` | ✓ | ✓ | ✓ | ✓ |
+| QUIC | `quic://` | ✓ | — | — | — |
+| UDP (datagram) | `udp://` | ✓ | — | ✓ | — |
+| VSOCK (Linux VM) | `vsock://` | ✓ | — | — | — |
+| DTLS | `dtls://` | aborted | — | ✓ | — |
+| In-process | `inproc://` | not yet | ✓ | ✓ | ✓ |
+| ZeroTier | `zt://` | — | ✓ | — | — |
+| Socket / fd passthrough | `socket://` | — | — | ✓ | — |
+
+The two IPC rows reflect a wire-format break between NNG generations: NNG 1.5
+uses a 9-byte frame header (`\x01` type byte + 8-byte length); NNG 2 uses the
+same 8-byte header as TCP. nng-core implements both: `ipc://` speaks the 1.5
+wire format (interoperable with libnng 1.5.x and nngcat), `ipc2://` speaks the
+NNG 2 format.
+
+`inproc://` is not yet implemented. Its main appeal is URL portability: code
+that uses `inproc://` in tests can switch to `tcp://` in production by changing
+one string, with no other changes — mangos supports it for exactly this reason.
+The obstacle is architectural: `inproc://` requires a process-global name
+registry (a static table that `listen` inserts into and `dial` looks up), which
+is at odds with nng-core's otherwise stateless transport layer. It could be
+added, but has not been prioritized.
+
+`socket://` (libnng v2's fd-passthrough transport, e.g. `socket://fd/5`) is
+also omitted, for different reasons. The escape hatch already exists:
+`FramedTransport<T>` is generic over any `T: Read + Write`, so a caller with a
+raw fd can convert it to a tokio `TcpStream` via `FromRawFd` and construct a
+`FramedTransport` directly without any URL dispatch. Hiding that behind a URL
+string would obscure the `unsafe` that `FromRawFd` requires. There is also no
+interop pressure yet — `socket://` only exists in libnng v2 alpha.
+
+### Cargo features
+
 | Feature | Default | Description |
 |---|---|---|
 | `std` | yes | Enables tokio TCP transport and the high-level socket API |

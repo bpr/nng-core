@@ -549,6 +549,11 @@ pub(crate) mod quic;
 #[cfg(feature = "vsock")]
 pub(crate) mod vsock;
 
+#[cfg(feature = "dtls")]
+pub mod dtls;
+#[cfg(feature = "dtls")]
+pub use dtls::DtlsTransport;
+
 #[cfg(feature = "udp")]
 pub mod udp;
 #[cfg(feature = "udp")]

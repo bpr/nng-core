@@ -23,6 +23,7 @@ vsock   = ["std", "dep:tokio-vsock"]
 udp     = ["std"]
 tower   = ["std", "dep:tower-service"]
 streams = ["std", "dep:futures-core", "dep:futures-sink", "dep:futures-util"]
+dtls    = ["std", "udp", "dep:dimpl"]
 
 [dependencies]
 embedded-io-async = "0.7"
@@ -38,6 +39,7 @@ rustls-native-certs = { version = "0.8", optional = true }
 quinn = { version = "0.11", optional = true }
 tokio-vsock = { version = "0.7", optional = true }
 tower-service = { version = "0.3", optional = true }
+dimpl = { version = "0.6.1", default-features = false, features = ["rust-crypto"], optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

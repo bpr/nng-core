@@ -10,6 +10,7 @@
 //! - `quic://host:port` — QUIC / TLS 1.3 (requires `quic` feature)
 //! - `vsock://CID:port` — VSOCK VM transport, Linux only (requires `vsock` feature)
 //! - `udp://host:port` — UDP datagram (requires `udp` feature; no SP handshake)
+//! - `dtls://host:port` — DTLS 1.2 over UDP (requires `dtls` feature; use `listen_dtls` / `dial_dtls`)
 //!
 //! Each socket type wraps an `AnyTransport`, which dispatches to either
 //! `FramedTransport` (TCP / IPC) or `WsTransport` (WebSocket / TLS)
@@ -47,6 +48,9 @@ use crate::transport::tls_tcp::{
 #[cfg(feature = "udp")]
 use crate::transport::udp::UdpTransport;
 
+#[cfg(feature = "dtls")]
+use crate::transport::dtls::DtlsTransport;
+
 #[cfg(feature = "quic")]
 use crate::transport::quic::{self as quic_mod, QuicStream};
 
@@ -63,6 +67,8 @@ pub(crate) enum AnyTransport {
     Ws(WsTransport),
     #[cfg(feature = "udp")]
     Udp(UdpTransport),
+    #[cfg(feature = "dtls")]
+    Dtls(DtlsTransport),
 }
 
 impl AnyTransport {
@@ -73,6 +79,8 @@ impl AnyTransport {
             Self::Ws(t) => t.send(msg).await.map_err(ws_err_to_nng),
             #[cfg(feature = "udp")]
             Self::Udp(t) => t.send(msg).await.map_err(NngError::from),
+            #[cfg(feature = "dtls")]
+            Self::Dtls(t) => t.send(msg).await.map_err(NngError::from),
         }
     }
 
@@ -83,6 +91,8 @@ impl AnyTransport {
             Self::Ws(t) => t.recv().await.map_err(ws_err_to_nng),
             #[cfg(feature = "udp")]
             Self::Udp(t) => t.recv().await.map_err(NngError::from),
+            #[cfg(feature = "dtls")]
+            Self::Dtls(t) => t.recv().await.map_err(NngError::from),
         }
     }
 }
@@ -432,6 +442,10 @@ pub(crate) async fn bind_listener(addr: &str) -> Result<AnyListener, NngError> {
         Err(NngError::ProtocolViolation(
             "quic:// requires listen_quic — use listen_quic(addr, cert_pem, key_pem)".into(),
         ))
+    } else if addr.starts_with("dtls://") {
+        Err(NngError::ProtocolViolation(
+            "dtls:// requires listen_dtls — use listen_dtls(addr, cert)".into(),
+        ))
     } else if let Some(vsock_addr) = addr.strip_prefix("vsock://") {
         #[cfg(feature = "vsock")]
         {
@@ -599,6 +613,11 @@ pub(crate) async fn connect_transport(
             .await
             .map(AnyTransport::Framed)
             .map_err(NngError::from);
+    }
+    if addr.starts_with("dtls://") {
+        return Err(NngError::ProtocolViolation(
+            "dtls:// requires dial_dtls — use dial_dtls(addr, cert)".into(),
+        ));
     }
     let stream = connect_stream(addr).await?;
     connect_framed(stream, proto)
@@ -951,6 +970,61 @@ impl<P> Socket<P> {
             .await
             .map(|t| Self::new(AnyTransport::Framed(t), proto))
             .map_err(NngError::from)
+    }
+
+    /// Bind a `dtls://` listener and wait for the first DTLS client.
+    ///
+    /// `addr` must start with `dtls://` followed by a `host:port` string.
+    /// Both sides supply their own [`dimpl::DtlsCertificate`]; peer certificate
+    /// validation is not performed by the initial implementation (any
+    /// self-signed certificate is accepted).
+    #[cfg(feature = "dtls")]
+    pub async fn listen_dtls(
+        addr: &str,
+        proto: ProtocolId,
+        cert: dimpl::DtlsCertificate,
+    ) -> Result<Self, NngError> {
+        let host_port = addr
+            .strip_prefix("dtls://")
+            .ok_or_else(|| NngError::Io(io::Error::other("listen_dtls requires a dtls:// URL")))?;
+        let transport = DtlsTransport::bind(host_port, cert)
+            .await
+            .map_err(NngError::from)?;
+        Ok(Self::new(AnyTransport::Dtls(transport), proto))
+    }
+
+    /// Wrap an already-bound [`tokio::net::UdpSocket`] as a DTLS server socket.
+    ///
+    /// Useful when you need to learn the OS-assigned port before handing the
+    /// socket to the transport (avoiding the bind → drop → rebind TOCTOU race
+    /// that arises when using [`listen_dtls`](Self::listen_dtls) with a port-0
+    /// URL).  The socket must already be bound; this function is synchronous.
+    #[cfg(feature = "dtls")]
+    pub fn listen_dtls_socket(
+        socket: tokio::net::UdpSocket,
+        proto: ProtocolId,
+        cert: dimpl::DtlsCertificate,
+    ) -> Result<Self, NngError> {
+        let transport = DtlsTransport::from_server_socket(socket, cert).map_err(NngError::from)?;
+        Ok(Self::new(AnyTransport::Dtls(transport), proto))
+    }
+
+    /// Connect to a `dtls://` server and complete the DTLS handshake.
+    ///
+    /// `addr` must start with `dtls://` followed by a `host:port` string.
+    #[cfg(feature = "dtls")]
+    pub async fn dial_dtls(
+        addr: &str,
+        proto: ProtocolId,
+        cert: dimpl::DtlsCertificate,
+    ) -> Result<Self, NngError> {
+        let host_port = addr
+            .strip_prefix("dtls://")
+            .ok_or_else(|| NngError::Io(io::Error::other("dial_dtls requires a dtls:// URL")))?;
+        let transport = DtlsTransport::connect(host_port, cert)
+            .await
+            .map_err(NngError::from)?;
+        Ok(Self::new(AnyTransport::Dtls(transport), proto))
     }
 
     /// Connect to `addr` and complete the handshake.
@@ -1714,6 +1788,27 @@ pub mod pipeline0 {
                 .map(Self)
         }
 
+        /// Bind a DTLS endpoint and wait for the first pull connection.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub async fn listen_dtls(
+            addr: &str,
+            cert: dimpl::DtlsCertificate,
+        ) -> Result<Self, NngError> {
+            Socket::listen_dtls(addr, ProtocolId::PUSH0, cert)
+                .await
+                .map(Self)
+        }
+
+        /// Dial a DTLS pull endpoint with a DTLS certificate.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub async fn dial_dtls(addr: &str, cert: dimpl::DtlsCertificate) -> Result<Self, NngError> {
+            Socket::dial_dtls(addr, ProtocolId::PUSH0, cert)
+                .await
+                .map(Self)
+        }
+
         pub async fn dial(addr: &str) -> Result<Self, NngError> {
             Socket::dial(addr, ProtocolId::PUSH0).await.map(Self)
         }
@@ -1827,6 +1922,40 @@ pub mod pipeline0 {
             client_config: std::sync::Arc<rustls::ClientConfig>,
         ) -> Result<Self, NngError> {
             Socket::dial_quic(addr, ProtocolId::PULL0, client_config)
+                .await
+                .map(Self)
+        }
+
+        /// Bind a DTLS endpoint and wait for the first push connection.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub async fn listen_dtls(
+            addr: &str,
+            cert: dimpl::DtlsCertificate,
+        ) -> Result<Self, NngError> {
+            Socket::listen_dtls(addr, ProtocolId::PULL0, cert)
+                .await
+                .map(Self)
+        }
+
+        /// Wrap an already-bound UDP socket as a DTLS pull server.
+        ///
+        /// Avoids the bind → drop → rebind TOCTOU race: bind to port 0, record
+        /// the assigned port, then pass the socket directly here.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub fn listen_dtls_socket(
+            socket: tokio::net::UdpSocket,
+            cert: dimpl::DtlsCertificate,
+        ) -> Result<Self, NngError> {
+            Socket::listen_dtls_socket(socket, ProtocolId::PULL0, cert).map(Self)
+        }
+
+        /// Dial a DTLS push endpoint with a DTLS certificate.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub async fn dial_dtls(addr: &str, cert: dimpl::DtlsCertificate) -> Result<Self, NngError> {
+            Socket::dial_dtls(addr, ProtocolId::PULL0, cert)
                 .await
                 .map(Self)
         }
@@ -2114,6 +2243,40 @@ pub mod pair0 {
                 .map(Self)
         }
 
+        /// Bind a DTLS endpoint and wait for the peer connection.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub async fn listen_dtls(
+            addr: &str,
+            cert: dimpl::DtlsCertificate,
+        ) -> Result<Self, NngError> {
+            Socket::listen_dtls(addr, ProtocolId::PAIR0, cert)
+                .await
+                .map(Self)
+        }
+
+        /// Wrap an already-bound UDP socket as a DTLS pair server.
+        ///
+        /// Avoids the bind → drop → rebind TOCTOU race: bind to port 0, record
+        /// the assigned port, then pass the socket directly here.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub fn listen_dtls_socket(
+            socket: tokio::net::UdpSocket,
+            cert: dimpl::DtlsCertificate,
+        ) -> Result<Self, NngError> {
+            Socket::listen_dtls_socket(socket, ProtocolId::PAIR0, cert).map(Self)
+        }
+
+        /// Dial a DTLS pair peer with a DTLS certificate.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub async fn dial_dtls(addr: &str, cert: dimpl::DtlsCertificate) -> Result<Self, NngError> {
+            Socket::dial_dtls(addr, ProtocolId::PAIR0, cert)
+                .await
+                .map(Self)
+        }
+
         pub async fn dial(addr: &str) -> Result<Self, NngError> {
             Socket::dial(addr, ProtocolId::PAIR0).await.map(Self)
         }
@@ -2269,6 +2432,15 @@ pub mod reqrep0 {
                 .map(Self::from_socket)
         }
 
+        /// Dial a DTLS rep server with a DTLS certificate.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub async fn dial_dtls(addr: &str, cert: dimpl::DtlsCertificate) -> Result<Self, NngError> {
+            Socket::dial_dtls(addr, ProtocolId::REQ0, cert)
+                .await
+                .map(Self::from_socket)
+        }
+
         /// Set the resend interval.
         ///
         /// When set, [`request`](Self::request) retransmits the request after
@@ -2391,6 +2563,37 @@ pub mod reqrep0 {
                     inner: s,
                     state: Rep0State::new(),
                 })
+        }
+
+        /// Bind a DTLS endpoint and wait for the first requester connection.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub async fn listen_dtls(
+            addr: &str,
+            cert: dimpl::DtlsCertificate,
+        ) -> Result<Self, NngError> {
+            Socket::listen_dtls(addr, ProtocolId::REP0, cert)
+                .await
+                .map(|s| Self {
+                    inner: s,
+                    state: Rep0State::new(),
+                })
+        }
+
+        /// Wrap an already-bound UDP socket as a DTLS reply server.
+        ///
+        /// Avoids the bind → drop → rebind TOCTOU race: bind to port 0, record
+        /// the assigned port, then pass the socket directly here.
+        /// Requires the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        pub fn listen_dtls_socket(
+            socket: tokio::net::UdpSocket,
+            cert: dimpl::DtlsCertificate,
+        ) -> Result<Self, NngError> {
+            Socket::listen_dtls_socket(socket, ProtocolId::REP0, cert).map(|s| Self {
+                inner: s,
+                state: Rep0State::new(),
+            })
         }
 
         /// Receive the next request.  Returns the application message plus a
