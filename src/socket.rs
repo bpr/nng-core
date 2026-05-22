@@ -9,8 +9,8 @@
 //! - `tls+tcp://host:port` — TLS over TCP (requires `tls-tcp` feature)
 //! - `quic://host:port` — QUIC / TLS 1.3 (requires `quic` feature)
 //! - `vsock://CID:port` — VSOCK VM transport, Linux only (requires `vsock` feature)
+//! - `kcp://host:port` — KCP / reliable UDP, no encryption (requires `kcp` feature)
 //! - `udp://host:port` — UDP datagram (requires `udp` feature; no SP handshake)
-//! - `dtls://host:port` — DTLS 1.2 over UDP (requires `dtls` feature; use `listen_dtls` / `dial_dtls`)
 //!
 //! Each socket type wraps an `AnyTransport`, which dispatches to either
 //! `FramedTransport` (TCP / IPC) or `WsTransport` (WebSocket / TLS)
@@ -48,9 +48,6 @@ use crate::transport::tls_tcp::{
 #[cfg(feature = "udp")]
 use crate::transport::udp::UdpTransport;
 
-#[cfg(feature = "dtls")]
-use crate::transport::dtls::DtlsTransport;
-
 #[cfg(feature = "quic")]
 use crate::transport::quic::{self as quic_mod, QuicStream};
 
@@ -59,6 +56,14 @@ use crate::transport::vsock::{self as vsock_mod, TokioVsockStream};
 #[cfg(feature = "vsock")]
 use tokio_vsock::VsockListener;
 
+#[cfg(feature = "kcp")]
+use crate::transport::kcp::{self as kcp_mod, TokioKcpStream};
+#[cfg(feature = "kcp")]
+use kcp_tokio::KcpListener;
+#[cfg(feature = "kcp")]
+use std::sync::Arc as StdArc;
+#[cfg(feature = "kcp")]
+use tokio::sync::Mutex as TokioMutex;
 // ── AnyTransport: FramedTransport or WsTransport ─────────────────────────────
 
 pub(crate) enum AnyTransport {
@@ -67,8 +72,6 @@ pub(crate) enum AnyTransport {
     Ws(WsTransport),
     #[cfg(feature = "udp")]
     Udp(UdpTransport),
-    #[cfg(feature = "dtls")]
-    Dtls(DtlsTransport),
 }
 
 impl AnyTransport {
@@ -79,8 +82,6 @@ impl AnyTransport {
             Self::Ws(t) => t.send(msg).await.map_err(ws_err_to_nng),
             #[cfg(feature = "udp")]
             Self::Udp(t) => t.send(msg).await.map_err(NngError::from),
-            #[cfg(feature = "dtls")]
-            Self::Dtls(t) => t.send(msg).await.map_err(NngError::from),
         }
     }
 
@@ -91,8 +92,6 @@ impl AnyTransport {
             Self::Ws(t) => t.recv().await.map_err(ws_err_to_nng),
             #[cfg(feature = "udp")]
             Self::Udp(t) => t.recv().await.map_err(NngError::from),
-            #[cfg(feature = "dtls")]
-            Self::Dtls(t) => t.recv().await.map_err(NngError::from),
         }
     }
 }
@@ -115,7 +114,6 @@ fn ws_err_to_nng(e: WsError) -> NngError {
 }
 
 // ── AnyStream: TCP or IPC behind a single trait impl ─────────────────────────
-
 pub(crate) enum AnyStream {
     Tcp(TokioTcpStream),
     /// NNG 1.5.x IPC: 9-byte frame header (0x01 type + 8-byte length).
@@ -133,6 +131,9 @@ pub(crate) enum AnyStream {
     /// VSOCK stream: 8-byte frame header, Linux AF_VSOCK socket layer.
     #[cfg(feature = "vsock")]
     Vsock(TokioVsockStream),
+    /// KCP stream: 8-byte frame header, KCP socket layer.
+    #[cfg(feature = "kcp")]
+    Kcp(TokioKcpStream),
 }
 
 impl ErrorType for AnyStream {
@@ -151,6 +152,8 @@ impl EioRead for AnyStream {
             Self::Quic(s) => EioRead::read(s, buf).await,
             #[cfg(feature = "vsock")]
             Self::Vsock(s) => EioRead::read(s, buf).await,
+            #[cfg(feature = "kcp")]
+            Self::Kcp(s) => EioRead::read(s, buf).await,
         }
     }
 }
@@ -167,6 +170,8 @@ impl EioWrite for AnyStream {
             Self::Quic(s) => EioWrite::write(s, buf).await,
             #[cfg(feature = "vsock")]
             Self::Vsock(s) => EioWrite::write(s, buf).await,
+            #[cfg(feature = "kcp")]
+            Self::Kcp(s) => EioWrite::write(s, buf).await,
         }
     }
 
@@ -181,6 +186,8 @@ impl EioWrite for AnyStream {
             Self::Quic(s) => EioWrite::flush(s).await,
             #[cfg(feature = "vsock")]
             Self::Vsock(s) => EioWrite::flush(s).await,
+            #[cfg(feature = "kcp")]
+            Self::Kcp(s) => EioWrite::flush(s).await,
         }
     }
 }
@@ -199,12 +206,13 @@ impl AnyStream {
             Self::Quic(_) => FrameFormat::Tcp,
             #[cfg(feature = "vsock")]
             Self::Vsock(_) => FrameFormat::Tcp,
+            #[cfg(feature = "kcp")]
+            Self::Kcp(_) => FrameFormat::Tcp,
         }
     }
 }
 
 // ── AnyListener: TCP, IPC, or WebSocket ──────────────────────────────────────
-
 pub(crate) enum AnyListener {
     Tcp(TcpListener),
     /// NNG 1.5.x IPC: 9-byte frame header.
@@ -226,6 +234,15 @@ pub(crate) enum AnyListener {
     /// VSOCK listener: Linux AF_VSOCK, 8-byte TCP frame header.
     #[cfg(feature = "vsock")]
     Vsock(VsockListener),
+    /// KCP listener.  Wrapped in `TokioMutex` because
+    /// `KcpListener::accept` requires `&mut self` (so we wrap in `TokioMutex`),
+    /// and the listener owns the shared UDP socket plus a background routing
+    /// task that every accepted [`kcp_tokio::KcpStream`] depends on — dropping
+    /// it kills the streams.  We therefore hold an [`StdArc`] so accepted
+    /// streams can clone a reference and keep the listener alive past the
+    /// `Socket::listen` scope.  See the `src/transport/kcp.rs` module docs.
+    #[cfg(feature = "kcp")]
+    Kcp(StdArc<TokioMutex<KcpListener>>),
 }
 
 impl AnyListener {
@@ -301,6 +318,21 @@ impl AnyListener {
                     .map(AnyTransport::Framed)
                     .map_err(NngError::from)
             }
+            #[cfg(feature = "kcp")]
+            Self::Kcp(l) => {
+                let keepalive = l.clone();
+                let (kcp, _peer) = {
+                    let mut guard = l.lock().await;
+                    guard
+                        .accept()
+                        .await
+                        .map_err(|e| io::Error::other(format!("kcp accept failed: {e}")))?
+                };
+                connect_framed(AnyStream::Kcp(TokioKcpStream(kcp, Some(keepalive))), proto)
+                    .await
+                    .map(AnyTransport::Framed)
+                    .map_err(NngError::from)
+            }
         }
     }
 
@@ -349,6 +381,21 @@ impl AnyListener {
             Self::Vsock(l) => {
                 let (stream, _) = l.accept().await?;
                 Ok(RawConn::Stream(AnyStream::Vsock(TokioVsockStream(stream))))
+            }
+            #[cfg(feature = "kcp")]
+            Self::Kcp(l) => {
+                let keepalive = l.clone();
+                let (kcp, _peer) = {
+                    let mut guard = l.lock().await;
+                    guard
+                        .accept()
+                        .await
+                        .map_err(|e| io::Error::other(format!("kcp accept failed: {e}")))?
+                };
+                Ok(RawConn::Stream(AnyStream::Kcp(TokioKcpStream(
+                    kcp,
+                    Some(keepalive),
+                ))))
             }
         }
     }
@@ -442,10 +489,6 @@ pub(crate) async fn bind_listener(addr: &str) -> Result<AnyListener, NngError> {
         Err(NngError::ProtocolViolation(
             "quic:// requires listen_quic — use listen_quic(addr, cert_pem, key_pem)".into(),
         ))
-    } else if addr.starts_with("dtls://") {
-        Err(NngError::ProtocolViolation(
-            "dtls:// requires listen_dtls — use listen_dtls(addr, cert)".into(),
-        ))
     } else if let Some(vsock_addr) = addr.strip_prefix("vsock://") {
         #[cfg(feature = "vsock")]
         {
@@ -457,6 +500,19 @@ pub(crate) async fn bind_listener(addr: &str) -> Result<AnyListener, NngError> {
         {
             let _ = vsock_addr;
             return Err(NngError::FeatureNotEnabled("vsock"));
+        }
+    } else if let Some(kcp_addr) = addr.strip_prefix("kcp://") {
+        #[cfg(feature = "kcp")]
+        {
+            return kcp_mod::bind_kcp_listener(kcp_addr)
+                .await
+                .map(|l| AnyListener::Kcp(StdArc::new(TokioMutex::new(l))))
+                .map_err(NngError::from);
+        }
+        #[cfg(not(feature = "kcp"))]
+        {
+            let _ = kcp_addr;
+            return Err(NngError::FeatureNotEnabled("kcp"));
         }
     } else {
         Err(NngError::UnsupportedScheme(addr.to_owned()))
@@ -564,6 +620,7 @@ pub(crate) async fn connect_stream(addr: &str) -> Result<AnyStream, NngError> {
             let _ = tls_addr;
             return Err(NngError::FeatureNotEnabled("tls-tcp"));
         }
+    // 666 URL dispatch in connect_stream
     } else if let Some(vsock_addr) = addr.strip_prefix("vsock://") {
         #[cfg(feature = "vsock")]
         {
@@ -576,6 +633,19 @@ pub(crate) async fn connect_stream(addr: &str) -> Result<AnyStream, NngError> {
         {
             let _ = vsock_addr;
             return Err(NngError::FeatureNotEnabled("vsock"));
+        }
+    } else if let Some(kcp_addr) = addr.strip_prefix("kcp://") {
+        #[cfg(feature = "kcp")]
+        {
+            return kcp_mod::connect_kcp_stream(kcp_addr)
+                .await
+                .map(|s| AnyStream::Kcp(TokioKcpStream(s, None)))
+                .map_err(NngError::from);
+        }
+        #[cfg(not(feature = "kcp"))]
+        {
+            let _ = kcp_addr;
+            return Err(NngError::FeatureNotEnabled("kcp"));
         }
     } else {
         Err(NngError::UnsupportedScheme(addr.to_owned()))
@@ -613,11 +683,6 @@ pub(crate) async fn connect_transport(
             .await
             .map(AnyTransport::Framed)
             .map_err(NngError::from);
-    }
-    if addr.starts_with("dtls://") {
-        return Err(NngError::ProtocolViolation(
-            "dtls:// requires dial_dtls — use dial_dtls(addr, cert)".into(),
-        ));
     }
     let stream = connect_stream(addr).await?;
     connect_framed(stream, proto)
@@ -972,59 +1037,50 @@ impl<P> Socket<P> {
             .map_err(NngError::from)
     }
 
-    /// Bind a `dtls://` listener and wait for the first DTLS client.
+    /// Bind a `kcp://` listener with a caller-supplied [`kcp_tokio::KcpConfig`]
+    /// and wait for the first connection.
     ///
-    /// `addr` must start with `dtls://` followed by a `host:port` string.
-    /// Both sides supply their own [`dimpl::DtlsCertificate`]; peer certificate
-    /// validation is not performed by the initial implementation (any
-    /// self-signed certificate is accepted).
-    #[cfg(feature = "dtls")]
-    pub async fn listen_dtls(
+    /// Both peers MUST use the same config (MTU, snd_wnd, rcv_wnd,
+    /// nodelay/interval, fast_resend, …) for correct ARQ behavior.  Use
+    /// [`listen`](Self::listen) with a `kcp://` URL for the default config.
+    #[cfg(feature = "kcp")]
+    pub async fn listen_kcp_with(
         addr: &str,
         proto: ProtocolId,
-        cert: dimpl::DtlsCertificate,
+        config: kcp_tokio::KcpConfig,
     ) -> Result<Self, NngError> {
-        let host_port = addr
-            .strip_prefix("dtls://")
-            .ok_or_else(|| NngError::Io(io::Error::other("listen_dtls requires a dtls:// URL")))?;
-        let transport = DtlsTransport::bind(host_port, cert)
+        let kcp_addr = addr.strip_prefix("kcp://").ok_or_else(|| {
+            NngError::Io(io::Error::other("listen_kcp_with requires a kcp:// URL"))
+        })?;
+        let listener = kcp_mod::bind_kcp_listener_with(kcp_addr, config)
             .await
             .map_err(NngError::from)?;
-        Ok(Self::new(AnyTransport::Dtls(transport), proto))
+        let listener = AnyListener::Kcp(StdArc::new(TokioMutex::new(listener)));
+        let transport = listener.accept_as_transport(proto).await?;
+        Ok(Self::new(transport, proto))
     }
 
-    /// Wrap an already-bound [`tokio::net::UdpSocket`] as a DTLS server socket.
+    /// Dial a `kcp://` server with a caller-supplied [`kcp_tokio::KcpConfig`].
     ///
-    /// Useful when you need to learn the OS-assigned port before handing the
-    /// socket to the transport (avoiding the bind → drop → rebind TOCTOU race
-    /// that arises when using [`listen_dtls`](Self::listen_dtls) with a port-0
-    /// URL).  The socket must already be bound; this function is synchronous.
-    #[cfg(feature = "dtls")]
-    pub fn listen_dtls_socket(
-        socket: tokio::net::UdpSocket,
-        proto: ProtocolId,
-        cert: dimpl::DtlsCertificate,
-    ) -> Result<Self, NngError> {
-        let transport = DtlsTransport::from_server_socket(socket, cert).map_err(NngError::from)?;
-        Ok(Self::new(AnyTransport::Dtls(transport), proto))
-    }
-
-    /// Connect to a `dtls://` server and complete the DTLS handshake.
-    ///
-    /// `addr` must start with `dtls://` followed by a `host:port` string.
-    #[cfg(feature = "dtls")]
-    pub async fn dial_dtls(
+    /// See [`listen_kcp_with`](Self::listen_kcp_with) for the config
+    /// symmetry requirement.
+    #[cfg(feature = "kcp")]
+    pub async fn dial_kcp_with(
         addr: &str,
         proto: ProtocolId,
-        cert: dimpl::DtlsCertificate,
+        config: kcp_tokio::KcpConfig,
     ) -> Result<Self, NngError> {
-        let host_port = addr
-            .strip_prefix("dtls://")
-            .ok_or_else(|| NngError::Io(io::Error::other("dial_dtls requires a dtls:// URL")))?;
-        let transport = DtlsTransport::connect(host_port, cert)
+        let kcp_addr = addr
+            .strip_prefix("kcp://")
+            .ok_or_else(|| NngError::Io(io::Error::other("dial_kcp_with requires a kcp:// URL")))?;
+        let stream = kcp_mod::connect_kcp_stream_with(kcp_addr, config)
             .await
             .map_err(NngError::from)?;
-        Ok(Self::new(AnyTransport::Dtls(transport), proto))
+        let any_stream = AnyStream::Kcp(TokioKcpStream(stream, None));
+        connect_framed(any_stream, proto)
+            .await
+            .map(|t| Self::new(AnyTransport::Framed(t), proto))
+            .map_err(NngError::from)
     }
 
     /// Connect to `addr` and complete the handshake.
@@ -1788,23 +1844,26 @@ pub mod pipeline0 {
                 .map(Self)
         }
 
-        /// Bind a DTLS endpoint and wait for the first pull connection.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub async fn listen_dtls(
+        /// Bind a `kcp://` listener with a caller-supplied [`kcp_tokio::KcpConfig`].
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn listen_kcp_with(
             addr: &str,
-            cert: dimpl::DtlsCertificate,
+            config: kcp_tokio::KcpConfig,
         ) -> Result<Self, NngError> {
-            Socket::listen_dtls(addr, ProtocolId::PUSH0, cert)
+            Socket::listen_kcp_with(addr, ProtocolId::PUSH0, config)
                 .await
                 .map(Self)
         }
 
-        /// Dial a DTLS pull endpoint with a DTLS certificate.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub async fn dial_dtls(addr: &str, cert: dimpl::DtlsCertificate) -> Result<Self, NngError> {
-            Socket::dial_dtls(addr, ProtocolId::PUSH0, cert)
+        /// Dial a `kcp://` server with a caller-supplied [`kcp_tokio::KcpConfig`].
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn dial_kcp_with(
+            addr: &str,
+            config: kcp_tokio::KcpConfig,
+        ) -> Result<Self, NngError> {
+            Socket::dial_kcp_with(addr, ProtocolId::PUSH0, config)
                 .await
                 .map(Self)
         }
@@ -1926,36 +1985,26 @@ pub mod pipeline0 {
                 .map(Self)
         }
 
-        /// Bind a DTLS endpoint and wait for the first push connection.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub async fn listen_dtls(
+        /// Bind a `kcp://` listener with a caller-supplied [`kcp_tokio::KcpConfig`].
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn listen_kcp_with(
             addr: &str,
-            cert: dimpl::DtlsCertificate,
+            config: kcp_tokio::KcpConfig,
         ) -> Result<Self, NngError> {
-            Socket::listen_dtls(addr, ProtocolId::PULL0, cert)
+            Socket::listen_kcp_with(addr, ProtocolId::PULL0, config)
                 .await
                 .map(Self)
         }
 
-        /// Wrap an already-bound UDP socket as a DTLS pull server.
-        ///
-        /// Avoids the bind → drop → rebind TOCTOU race: bind to port 0, record
-        /// the assigned port, then pass the socket directly here.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub fn listen_dtls_socket(
-            socket: tokio::net::UdpSocket,
-            cert: dimpl::DtlsCertificate,
+        /// Dial a `kcp://` server with a caller-supplied [`kcp_tokio::KcpConfig`].
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn dial_kcp_with(
+            addr: &str,
+            config: kcp_tokio::KcpConfig,
         ) -> Result<Self, NngError> {
-            Socket::listen_dtls_socket(socket, ProtocolId::PULL0, cert).map(Self)
-        }
-
-        /// Dial a DTLS push endpoint with a DTLS certificate.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub async fn dial_dtls(addr: &str, cert: dimpl::DtlsCertificate) -> Result<Self, NngError> {
-            Socket::dial_dtls(addr, ProtocolId::PULL0, cert)
+            Socket::dial_kcp_with(addr, ProtocolId::PULL0, config)
                 .await
                 .map(Self)
         }
@@ -2243,36 +2292,26 @@ pub mod pair0 {
                 .map(Self)
         }
 
-        /// Bind a DTLS endpoint and wait for the peer connection.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub async fn listen_dtls(
+        /// Bind a `kcp://` listener with a caller-supplied [`kcp_tokio::KcpConfig`].
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn listen_kcp_with(
             addr: &str,
-            cert: dimpl::DtlsCertificate,
+            config: kcp_tokio::KcpConfig,
         ) -> Result<Self, NngError> {
-            Socket::listen_dtls(addr, ProtocolId::PAIR0, cert)
+            Socket::listen_kcp_with(addr, ProtocolId::PAIR0, config)
                 .await
                 .map(Self)
         }
 
-        /// Wrap an already-bound UDP socket as a DTLS pair server.
-        ///
-        /// Avoids the bind → drop → rebind TOCTOU race: bind to port 0, record
-        /// the assigned port, then pass the socket directly here.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub fn listen_dtls_socket(
-            socket: tokio::net::UdpSocket,
-            cert: dimpl::DtlsCertificate,
+        /// Dial a `kcp://` peer with a caller-supplied [`kcp_tokio::KcpConfig`].
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn dial_kcp_with(
+            addr: &str,
+            config: kcp_tokio::KcpConfig,
         ) -> Result<Self, NngError> {
-            Socket::listen_dtls_socket(socket, ProtocolId::PAIR0, cert).map(Self)
-        }
-
-        /// Dial a DTLS pair peer with a DTLS certificate.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub async fn dial_dtls(addr: &str, cert: dimpl::DtlsCertificate) -> Result<Self, NngError> {
-            Socket::dial_dtls(addr, ProtocolId::PAIR0, cert)
+            Socket::dial_kcp_with(addr, ProtocolId::PAIR0, config)
                 .await
                 .map(Self)
         }
@@ -2432,11 +2471,14 @@ pub mod reqrep0 {
                 .map(Self::from_socket)
         }
 
-        /// Dial a DTLS rep server with a DTLS certificate.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub async fn dial_dtls(addr: &str, cert: dimpl::DtlsCertificate) -> Result<Self, NngError> {
-            Socket::dial_dtls(addr, ProtocolId::REQ0, cert)
+        /// Dial a `kcp://` server with a caller-supplied [`kcp_tokio::KcpConfig`].
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn dial_kcp_with(
+            addr: &str,
+            config: kcp_tokio::KcpConfig,
+        ) -> Result<Self, NngError> {
+            Socket::dial_kcp_with(addr, ProtocolId::REQ0, config)
                 .await
                 .map(Self::from_socket)
         }
@@ -2565,35 +2607,19 @@ pub mod reqrep0 {
                 })
         }
 
-        /// Bind a DTLS endpoint and wait for the first requester connection.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub async fn listen_dtls(
+        /// Bind a `kcp://` listener with a caller-supplied [`kcp_tokio::KcpConfig`].
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn listen_kcp_with(
             addr: &str,
-            cert: dimpl::DtlsCertificate,
+            config: kcp_tokio::KcpConfig,
         ) -> Result<Self, NngError> {
-            Socket::listen_dtls(addr, ProtocolId::REP0, cert)
+            Socket::listen_kcp_with(addr, ProtocolId::REP0, config)
                 .await
                 .map(|s| Self {
                     inner: s,
                     state: Rep0State::new(),
                 })
-        }
-
-        /// Wrap an already-bound UDP socket as a DTLS reply server.
-        ///
-        /// Avoids the bind → drop → rebind TOCTOU race: bind to port 0, record
-        /// the assigned port, then pass the socket directly here.
-        /// Requires the `dtls` feature.
-        #[cfg(feature = "dtls")]
-        pub fn listen_dtls_socket(
-            socket: tokio::net::UdpSocket,
-            cert: dimpl::DtlsCertificate,
-        ) -> Result<Self, NngError> {
-            Socket::listen_dtls_socket(socket, ProtocolId::REP0, cert).map(|s| Self {
-                inner: s,
-                state: Rep0State::new(),
-            })
         }
 
         /// Receive the next request.  Returns the application message plus a

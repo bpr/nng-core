@@ -133,7 +133,7 @@ mangos (the reference Go implementation). libnng v2 is currently in alpha.
 | QUIC | `quic://` | ✓ | — | — | — |
 | UDP (datagram) | `udp://` | ✓ | — | ✓ | — |
 | VSOCK (Linux VM) | `vsock://` | ✓ | — | — | — |
-| DTLS | `dtls://` | aborted | — | ✓ | — |
+| DTLS | `dtls://` | — | — | ✓ | — |
 | In-process | `inproc://` | not yet | ✓ | ✓ | ✓ |
 | ZeroTier | `zt://` | — | ✓ | — | — |
 | Socket / fd passthrough | `socket://` | — | — | ✓ | — |
