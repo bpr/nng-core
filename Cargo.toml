@@ -63,6 +63,12 @@ required-features = ["quic"]
 #name = "kcp_reqrep"
 #required-features = ["kcp"]
 
+[[example]]
+name = "auth_then_data"
+
+[[example]]
+name = "tictactoe"
+
 [[bench]]
 name = "latency"
 harness = false

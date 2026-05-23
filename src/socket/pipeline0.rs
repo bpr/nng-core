@@ -12,7 +12,7 @@ use crate::{
     socket::{NngError, ReconnectOptions, Socket},
 };
 
-use super::{AnyTransport, bind_listener};
+use super::{AnyListener, AnyTransport, bind_listener};
 
 /// Push socket: sends messages to a single connected pull endpoint.
 pub struct Push0(Socket<Push0State>);
@@ -142,6 +142,14 @@ impl Push0Fan {
 /// promptly, even if their peers are idle.
 pub struct Pull0Fan {
     rx: tokio::sync::mpsc::Receiver<Result<Message, NngError>>,
+    /// Cloned by [`bind`](Self::bind)'s [`add_pusher`](Self::add_pusher)
+    /// to wire each new sender into the shared receive channel.
+    tx: tokio::sync::mpsc::Sender<Result<Message, NngError>>,
+    /// Cloned by [`add_pusher`](Self::add_pusher) so new reader tasks
+    /// observe the shutdown watch alongside the original ones.
+    shutdown_rx: tokio::sync::watch::Receiver<()>,
+    /// Running total of pushers ever added (via `listen_and_accept` or
+    /// `add_pusher`).  Inspected by [`sender_count`](Self::sender_count).
     n: usize,
     /// Dropping this sender closes the watch channel, which unblocks every
     /// background task's `cancel.changed()` call and causes it to exit.
@@ -155,41 +163,86 @@ impl Pull0Fan {
         let listener = bind_listener(addr).await?;
         let (tx, rx) = tokio::sync::mpsc::channel(n * 4);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let mut count = 0;
-        while count < n {
-            if let Ok(mut transport) = listener.accept_as_transport(ProtocolId::PULL0).await {
-                let tx2 = tx.clone();
-                let mut cancel = shutdown_rx.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            result = transport.recv() => {
-                                match result {
-                                    Ok(msg) => {
-                                        if tx2.send(Ok(msg)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx2.send(Err(e)).await;
-                                        break;
-                                    }
-                                }
-                            }
-                            // Fires (with Err) when the Pull0Fan is dropped and
-                            // the shutdown_tx Sender is closed.
-                            _ = cancel.changed() => break,
-                        }
-                    }
-                });
-                count += 1;
+        let mut fan = Self {
+            rx,
+            tx,
+            shutdown_rx,
+            n: 0,
+            _shutdown: shutdown_tx,
+        };
+        while fan.n < n {
+            if let Ok(transport) = listener.accept_as_transport(ProtocolId::PULL0).await {
+                fan.spawn_reader(transport);
             }
         }
-        Ok(Self {
+        Ok(fan)
+    }
+
+    /// Bind to `addr` and split the result into an empty fan plus an
+    /// [`AcceptStream`] yielding incoming pushers.  Mirrors
+    /// [`Bus0::bind`](crate::socket::bus0::Bus0::bind) and
+    /// [`Surveyor0::bind`](crate::socket::survey0::Surveyor0::bind): the
+    /// caller decides when and whether to admit each pusher.
+    ///
+    /// ```ignore
+    /// let (mut fan, mut accepts) = Pull0Fan::bind("tcp://127.0.0.1:5555").await?;
+    /// for _ in 0..3 {
+    ///     let p = accepts.accept().await?;
+    ///     fan.add_pusher(p);
+    /// }
+    /// // Drop accepts to stop admitting; fan.pull_any() now reads from the three.
+    /// ```
+    pub async fn bind(addr: &str) -> Result<(Self, AcceptStream), NngError> {
+        let listener = bind_listener(addr).await?;
+        // Channel capacity here is arbitrary; pick something reasonable for
+        // a hub that may grow over time.  Callers who need a different
+        // backpressure profile can adjust the queue separately.
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let fan = Self {
             rx,
-            n,
+            tx,
+            shutdown_rx,
+            n: 0,
             _shutdown: shutdown_tx,
-        })
+        };
+        Ok((fan, AcceptStream { listener }))
+    }
+
+    /// Add a pusher accepted via [`AcceptStream::accept`].
+    ///
+    /// Spawns a per-sender reader task — same cancellation-safety guarantees
+    /// as the senders added by [`listen_and_accept`](Self::listen_and_accept).
+    pub fn add_pusher(&mut self, pusher: AcceptedPusher) {
+        self.spawn_reader(pusher.0);
+    }
+
+    fn spawn_reader(&mut self, mut transport: AnyTransport) {
+        let tx = self.tx.clone();
+        let mut cancel = self.shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = transport.recv() => {
+                        match result {
+                            Ok(msg) => {
+                                if tx.send(Ok(msg)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e)).await;
+                                break;
+                            }
+                        }
+                    }
+                    // Fires (with Err) when the Pull0Fan is dropped and the
+                    // shutdown_tx Sender is closed.
+                    _ = cancel.changed() => break,
+                }
+            }
+        });
+        self.n += 1;
     }
 
     /// Receive the next message from any connected sender.
@@ -206,9 +259,32 @@ impl Pull0Fan {
         }
     }
 
-    /// Number of senders accepted at construction time.
+    /// Running total of pushers ever added (via
+    /// [`listen_and_accept`](Self::listen_and_accept) or
+    /// [`add_pusher`](Self::add_pusher)).  Does **not** decrement when a
+    /// sender disconnects — see the disconnect handling in
+    /// [`pull_any`](Self::pull_any).
     pub fn sender_count(&self) -> usize {
         self.n
+    }
+}
+
+/// A pusher accepted via [`AcceptStream::accept`], ready to be handed to
+/// [`Pull0Fan::add_pusher`].  Opaque newtype around an internal transport.
+pub struct AcceptedPusher(pub(crate) AnyTransport);
+
+/// Stream of incoming PUSH peer connections produced by [`Pull0Fan::bind`].
+pub struct AcceptStream {
+    listener: AnyListener,
+}
+
+impl AcceptStream {
+    /// Await the next incoming pusher and complete its SP handshake.
+    pub async fn accept(&mut self) -> Result<AcceptedPusher, NngError> {
+        self.listener
+            .accept_as_transport(ProtocolId::PULL0)
+            .await
+            .map(AcceptedPusher)
     }
 }
 

@@ -144,4 +144,79 @@ impl Bus0 {
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
+
+    // ── Stream-based accept API ───────────────────────────────────────────
+
+    /// Bind to `addr` and split the result into an empty hub plus an
+    /// [`AcceptStream`] yielding incoming peers.
+    ///
+    /// This is the preferred shape for dynamic membership: the caller
+    /// decides when and whether to admit each incoming peer, rather than
+    /// pre-committing to a fixed `n` as
+    /// [`listen_and_accept`](Self::listen_and_accept) requires.
+    ///
+    /// ```ignore
+    /// use nng_core::socket::bus0::Bus0;
+    ///
+    /// let (mut hub, mut accepts) = Bus0::bind("tcp://127.0.0.1:5555").await?;
+    ///
+    /// // Admit the first three peers, then keep serving the hub.
+    /// for _ in 0..3 {
+    ///     let peer = accepts.accept().await?;
+    ///     hub.add_peer(peer);
+    /// }
+    /// // accepts can be dropped here, or kept for later admission, or
+    /// // moved into another task that filters by peer addr / rate-limits.
+    /// ```
+    ///
+    /// The returned [`Bus0`] has `listener: None`, so
+    /// [`accept_pending`](Self::accept_pending) is a no-op on it — admit
+    /// peers exclusively through the stream while it exists.  The classic
+    /// [`listen`](Self::listen) / [`listen_and_accept`](Self::listen_and_accept)
+    /// constructors are unchanged.
+    pub async fn bind(addr: &str) -> Result<(Self, AcceptStream), NngError> {
+        let listener = bind_listener(addr).await?;
+        let hub = Self {
+            listener: None,
+            peers: Vec::new(),
+        };
+        Ok((hub, AcceptStream { listener }))
+    }
+
+    /// Add an accepted peer (from [`AcceptStream::accept`]) to this hub.
+    ///
+    /// Subsequent [`broadcast`](Self::broadcast) calls will fan out to this
+    /// peer; [`recv_any`](Self::recv_any) will poll it.
+    pub fn add_peer(&mut self, peer: AcceptedPeer) {
+        self.peers.push(peer.0);
+    }
+}
+
+/// A BUS0-side accepted peer, ready to be handed to [`Bus0::add_peer`].
+///
+/// Opaque newtype around an internal transport.  Yielded by
+/// [`AcceptStream::accept`].
+pub struct AcceptedPeer(pub(crate) AnyTransport);
+
+/// Stream of incoming BUS0 peer connections produced by [`Bus0::bind`].
+///
+/// The stream stays alive as long as the listener socket: callers may
+/// keep it past hub construction to admit later peers, or drop it at any
+/// time to stop accepting.
+pub struct AcceptStream {
+    listener: AnyListener,
+}
+
+impl AcceptStream {
+    /// Await the next incoming peer and complete its SP handshake.
+    ///
+    /// Cancellation-safe in the same way the underlying transport's
+    /// accept is: dropping this future never loses a connection that was
+    /// already accepted at the kernel level.
+    pub async fn accept(&mut self) -> Result<AcceptedPeer, NngError> {
+        self.listener
+            .accept_as_transport(ProtocolId::BUS0)
+            .await
+            .map(AcceptedPeer)
+    }
 }

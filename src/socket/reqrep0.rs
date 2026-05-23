@@ -30,6 +30,26 @@ impl Req0 {
         }
     }
 
+    /// Start configuring a new request socket via the builder API.
+    ///
+    /// Preferred over the bare `dial` constructors when you need to set
+    /// any per-socket option (currently just `resend_time`, with more
+    /// likely to come).  The builder collects options first and applies
+    /// them atomically once a transport is dialed:
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    /// use nng_core::socket::reqrep0::Req0;
+    ///
+    /// let req = Req0::builder()
+    ///     .resend_time(Duration::from_secs(2))
+    ///     .dial("tcp://127.0.0.1:5555")
+    ///     .await?;
+    /// ```
+    pub fn builder() -> Req0Builder {
+        Req0Builder::default()
+    }
+
     forward_socket_method!(dial, ProtocolId::REQ0, from_socket);
     forward_socket_method!(dial_reconnecting, ProtocolId::REQ0, from_socket);
     forward_socket_method!(dial_with_reconnect, ProtocolId::REQ0, from_socket);
@@ -37,13 +57,17 @@ impl Req0 {
     forward_socket_method!(dial_quic, ProtocolId::REQ0, from_socket);
     forward_socket_method!(dial_kcp_with, ProtocolId::REQ0, from_socket);
 
-    /// Set the resend interval.
+    /// Set the resend interval at runtime.
     ///
     /// When set, [`request`](Self::request) retransmits the request after
     /// `d` with no reply and repeats until a valid reply arrives or the
     /// transport returns an error.  Matches NNG's `NNG_OPT_REQ_RESENDTIME`.
     ///
     /// Resend is disabled by default; `request()` waits indefinitely.
+    ///
+    /// Prefer [`Req0::builder().resend_time(d).dial(addr)`](Req0Builder::resend_time)
+    /// for initial configuration; this setter is intended for runtime
+    /// adjustment of an already-dialed socket.
     pub fn set_resend_time(&mut self, d: Duration) {
         self.resend_time = Some(d);
     }
@@ -82,6 +106,96 @@ impl Req0 {
                 }
             }
         }
+    }
+}
+
+/// Builder for [`Req0`].
+///
+/// Collect per-socket options here, then call a terminal `dial*` method to
+/// open the transport.  Every dial method on this type mirrors the
+/// matching `Req0::dial*` static method; the only difference is that the
+/// builder's options are applied to the resulting socket before it's
+/// returned.
+///
+/// Construct via [`Req0::builder`].
+#[derive(Debug, Default, Clone)]
+pub struct Req0Builder {
+    resend_time: Option<Duration>,
+}
+
+impl Req0Builder {
+    /// Resend the outgoing request every `d` if no reply arrives.
+    ///
+    /// Matches NNG's `NNG_OPT_REQ_RESENDTIME`.  Disabled by default
+    /// ([`Req0::request`] waits indefinitely).
+    pub fn resend_time(mut self, d: Duration) -> Self {
+        self.resend_time = Some(d);
+        self
+    }
+
+    fn apply(&self, mut req: Req0) -> Req0 {
+        req.resend_time = self.resend_time;
+        req
+    }
+
+    /// Dial `addr` and return the configured socket.
+    pub async fn dial(self, addr: &str) -> Result<Req0, NngError> {
+        Req0::dial(addr).await.map(|r| self.apply(r))
+    }
+
+    /// Dial with automatic reconnect using default backoff (100 ms → 30 s).
+    pub async fn dial_reconnecting(self, addr: &str) -> Result<Req0, NngError> {
+        Req0::dial_reconnecting(addr).await.map(|r| self.apply(r))
+    }
+
+    /// Dial with automatic reconnect using custom `ReconnectOptions`.
+    pub async fn dial_with_reconnect(
+        self,
+        addr: &str,
+        opts: ReconnectOptions,
+    ) -> Result<Req0, NngError> {
+        Req0::dial_with_reconnect(addr, opts)
+            .await
+            .map(|r| self.apply(r))
+    }
+
+    /// Dial a `tls+tcp://` server with a custom TLS client config.
+    /// Requires the `tls-tcp` feature.
+    #[cfg(feature = "tls-tcp")]
+    pub async fn dial_tls_tcp(
+        self,
+        addr: &str,
+        client_config: std::sync::Arc<rustls::ClientConfig>,
+    ) -> Result<Req0, NngError> {
+        Req0::dial_tls_tcp(addr, client_config)
+            .await
+            .map(|r| self.apply(r))
+    }
+
+    /// Dial a `quic://` server with a custom TLS client config.
+    /// Requires the `quic` feature.
+    #[cfg(feature = "quic")]
+    pub async fn dial_quic(
+        self,
+        addr: &str,
+        client_config: std::sync::Arc<rustls::ClientConfig>,
+    ) -> Result<Req0, NngError> {
+        Req0::dial_quic(addr, client_config)
+            .await
+            .map(|r| self.apply(r))
+    }
+
+    /// Dial a `kcp://` server with a caller-supplied `KcpConfig`.
+    /// Requires the `kcp` feature.  Both peers must use the same config.
+    #[cfg(feature = "kcp")]
+    pub async fn dial_kcp_with(
+        self,
+        addr: &str,
+        config: kcp_tokio::KcpConfig,
+    ) -> Result<Req0, NngError> {
+        Req0::dial_kcp_with(addr, config)
+            .await
+            .map(|r| self.apply(r))
     }
 }
 

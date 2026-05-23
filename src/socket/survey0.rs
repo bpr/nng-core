@@ -18,8 +18,17 @@ use super::{
 };
 
 /// Surveyor socket: broadcasts surveys to multiple respondents.
+///
+/// Constructed via [`listen`](Self::listen) (classic API, keeps the
+/// listener internally so [`wait_for_respondents`](Self::wait_for_respondents)
+/// and [`accept_pending`](Self::accept_pending) can admit peers) or via
+/// [`bind`](Self::bind) (stream-based API, returns an [`AcceptStream`]
+/// that the caller drives explicitly).
 pub struct Surveyor0 {
-    listener: AnyListener,
+    /// `Some` when constructed via [`listen`](Self::listen); `None` when
+    /// constructed via [`bind`](Self::bind) (the listener moved into the
+    /// returned [`AcceptStream`]).
+    listener: Option<AnyListener>,
     respondents: Vec<AnyTransport>,
     state: Surveyor0State,
     /// Deadline given to each `survey` call.  Matches NNG's `NNG_OPT_SURVEYOR_SURVEYTIME`.
@@ -28,14 +37,52 @@ pub struct Surveyor0 {
 
 impl Surveyor0 {
     /// Bind and start accepting respondent connections.
+    ///
+    /// The listener is kept internally so
+    /// [`wait_for_respondents`](Self::wait_for_respondents) and
+    /// [`accept_pending`](Self::accept_pending) can admit peers.  For a
+    /// stream-based accept API instead, see [`bind`](Self::bind).
     pub async fn listen(addr: &str) -> Result<Self, NngError> {
         let listener = bind_listener(addr).await?;
         Ok(Self {
-            listener,
+            listener: Some(listener),
             respondents: Vec::new(),
             state: Surveyor0State::new(),
             survey_time: Duration::from_secs(1),
         })
+    }
+
+    /// Bind to `addr` and split the result into an empty surveyor plus an
+    /// [`AcceptStream`] yielding incoming respondents.  Same shape as
+    /// [`Bus0::bind`](crate::socket::bus0::Bus0::bind): the caller decides
+    /// when and whether to admit each incoming respondent.
+    ///
+    /// ```ignore
+    /// let (mut surv, mut accepts) = Surveyor0::bind("tcp://127.0.0.1:5555").await?;
+    /// for _ in 0..3 {
+    ///     let r = accepts.accept().await?;
+    ///     surv.add_respondent(r);
+    /// }
+    /// // drop `accepts` to stop admitting; surv.survey(...) now polls just the three.
+    /// ```
+    ///
+    /// The returned `Surveyor0` has `listener: None`, so
+    /// [`wait_for_respondents`](Self::wait_for_respondents) and
+    /// [`accept_pending`](Self::accept_pending) become no-ops on it.
+    pub async fn bind(addr: &str) -> Result<(Self, AcceptStream), NngError> {
+        let listener = bind_listener(addr).await?;
+        let surv = Self {
+            listener: None,
+            respondents: Vec::new(),
+            state: Surveyor0State::new(),
+            survey_time: Duration::from_secs(1),
+        };
+        Ok((surv, AcceptStream { listener }))
+    }
+
+    /// Add a respondent accepted via [`AcceptStream::accept`].
+    pub fn add_respondent(&mut self, respondent: AcceptedRespondent) {
+        self.respondents.push(respondent.0);
     }
 
     /// Set the default survey deadline used by `survey()`.
@@ -46,13 +93,16 @@ impl Surveyor0 {
     }
 
     /// Block until at least `n` respondents have connected.
+    ///
+    /// No-op for `Surveyor0` constructed via [`bind`](Self::bind) — that
+    /// path has no internal listener; use the returned [`AcceptStream`]
+    /// instead.
     pub async fn wait_for_respondents(&mut self, n: usize) -> Result<(), NngError> {
+        let Some(listener) = &self.listener else {
+            return Ok(());
+        };
         while self.respondents.len() < n {
-            if let Ok(t) = self
-                .listener
-                .accept_as_transport(ProtocolId::SURVEYOR0)
-                .await
-            {
+            if let Ok(t) = listener.accept_as_transport(ProtocolId::SURVEYOR0).await {
                 self.respondents.push(t);
             }
         }
@@ -62,11 +112,15 @@ impl Surveyor0 {
     /// Accept any respondents that connected since the last call.
     ///
     /// Returns immediately when the kernel's accept queue is empty.
+    /// No-op for `Surveyor0` constructed via [`bind`](Self::bind).
     pub async fn accept_pending(&mut self) {
+        let Some(listener) = &self.listener else {
+            return;
+        };
         loop {
             let raw = tokio::select! {
                 biased;
-                result = self.listener.accept_raw() => match result {
+                result = listener.accept_raw() => match result {
                     Ok(raw) => raw,
                     Err(_) => break,
                 },
@@ -235,5 +289,26 @@ impl Respondent0 {
                 routing,
             },
         ))
+    }
+}
+
+/// A respondent accepted via [`AcceptStream::accept`], ready to be handed
+/// to [`Surveyor0::add_respondent`].  Opaque newtype around an internal
+/// transport.
+pub struct AcceptedRespondent(pub(crate) AnyTransport);
+
+/// Stream of incoming respondent connections produced by
+/// [`Surveyor0::bind`].
+pub struct AcceptStream {
+    listener: AnyListener,
+}
+
+impl AcceptStream {
+    /// Await the next incoming respondent and complete its SP handshake.
+    pub async fn accept(&mut self) -> Result<AcceptedRespondent, NngError> {
+        self.listener
+            .accept_as_transport(ProtocolId::SURVEYOR0)
+            .await
+            .map(AcceptedRespondent)
     }
 }

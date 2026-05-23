@@ -215,3 +215,43 @@ async fn survey_late_respondent_excluded() {
 
     respondent.await.unwrap();
 }
+
+/// `Surveyor0::bind` returns an empty surveyor plus an `AcceptStream`.
+#[tokio::test]
+async fn surveyor0_bind_admits_respondents_via_stream() {
+    const N_RESPONDENTS: usize = 3;
+
+    let addr = free_addr().await;
+    let (mut surveyor, mut accepts) = survey0::Surveyor0::bind(&addr).await.unwrap();
+
+    let mut resp_tasks = Vec::new();
+    for i in 0..N_RESPONDENTS {
+        let resp_addr = addr.clone();
+        resp_tasks.push(tokio::spawn(async move {
+            let mut resp = survey0::Respondent0::dial(&resp_addr).await.unwrap();
+            let (survey, handle) = resp.receive().await.unwrap();
+            assert_eq!(survey.body(), b"ping");
+            let mut reply = Message::new();
+            reply.push_back(format!("pong-{i}").as_bytes());
+            handle.respond(reply).await.unwrap();
+        }));
+    }
+
+    for _ in 0..N_RESPONDENTS {
+        let r = accepts.accept().await.unwrap();
+        surveyor.add_respondent(r);
+    }
+    drop(accepts);
+
+    let mut question = Message::new();
+    question.push_back(b"ping");
+    let responses = surveyor
+        .survey_with_timeout(question, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(responses.len(), N_RESPONDENTS);
+
+    for t in resp_tasks {
+        t.await.unwrap();
+    }
+}

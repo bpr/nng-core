@@ -199,3 +199,56 @@ async fn bus0_dynamic_membership() {
     assert_eq!(m1.body(), b"hello everyone");
     assert_eq!(m2.body(), b"hello everyone");
 }
+
+// ── New stream-based bind/accept API ─────────────────────────────────────────
+
+/// `Bus0::bind` returns an empty hub plus an `AcceptStream`.  The caller
+/// admits peers explicitly via `hub.add_peer(...)`, enabling per-peer
+/// policy without committing to a fixed N at construction time.
+#[tokio::test]
+async fn bus0_bind_admits_peers_via_stream() {
+    const N_PEERS: usize = 3;
+
+    let port = free_port();
+    let hub_addr = addr(port);
+    let hub_addr2 = hub_addr.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut hub, mut accepts) = Bus0::bind(&hub_addr2).await.unwrap();
+
+        // Admit exactly N peers via the stream, then broadcast.
+        for _ in 0..N_PEERS {
+            let peer = accepts.accept().await.unwrap();
+            hub.add_peer(peer);
+        }
+        assert_eq!(hub.peer_count(), N_PEERS);
+
+        let mut msg = Message::new();
+        msg.push_back(b"hi from hub");
+        hub.broadcast(msg).await.unwrap();
+
+        // Drop accepts here — no more peers will be admitted.
+        drop(accepts);
+
+        // Hold the hub long enough for clients to receive before any
+        // transport teardown.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let mut peers = Vec::with_capacity(N_PEERS);
+    for _ in 0..N_PEERS {
+        peers.push(Bus0::dial(&hub_addr).await.unwrap());
+    }
+
+    for mut p in peers {
+        let m = tokio::time::timeout(std::time::Duration::from_secs(2), p.recv_any())
+            .await
+            .expect("recv timeout")
+            .expect("recv error");
+        assert_eq!(m.body(), b"hi from hub");
+    }
+
+    server.await.unwrap();
+}

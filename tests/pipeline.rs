@@ -58,3 +58,50 @@ async fn pipeline_pull_listens_push_dials() {
 
     puller.await.unwrap();
 }
+
+/// `Pull0Fan::bind` returns an empty fan plus an `AcceptStream`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pull0fan_bind_admits_pushers_via_stream() {
+    const N_PUSHERS: usize = 3;
+    const N_MSGS: usize = 5;
+
+    let addr = free_addr().await;
+    let server_addr = addr.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut fan, mut accepts) = pipeline0::Pull0Fan::bind(&server_addr).await.unwrap();
+
+        for _ in 0..N_PUSHERS {
+            let p = accepts.accept().await.unwrap();
+            fan.add_pusher(p);
+        }
+        assert_eq!(fan.sender_count(), N_PUSHERS);
+        drop(accepts);
+
+        let mut received = 0;
+        while received < N_PUSHERS * N_MSGS {
+            let _ = fan.pull_any().await.unwrap();
+            received += 1;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut push_tasks = Vec::new();
+    for sender in 0..N_PUSHERS {
+        let dial_addr = addr.clone();
+        push_tasks.push(tokio::spawn(async move {
+            let mut push = pipeline0::Push0::dial(&dial_addr).await.unwrap();
+            for i in 0..N_MSGS {
+                let mut msg = Message::new();
+                msg.push_back(format!("s{sender}-m{i}").as_bytes());
+                push.push(msg).await.unwrap();
+            }
+        }));
+    }
+
+    for t in push_tasks {
+        t.await.unwrap();
+    }
+    server.await.unwrap();
+}
