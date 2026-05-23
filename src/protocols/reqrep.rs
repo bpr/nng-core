@@ -46,29 +46,17 @@ pub const PROTOCOL_ID_REP: ProtocolId = ProtocolId::REP0;
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 /// Errors produced by the REQ0 / REP0 state machines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum ReqRepError {
     /// Received reply ID did not match the ID of the pending request.
     ///
     /// This can happen if a stale reply arrives after a new request has been
     /// issued, or if the peer is misbehaving.
+    #[error("req/rep ID mismatch: got {got:#010x}, expected {expected:#010x}")]
     IdMismatch { got: u32, expected: u32 },
     /// Received message body was shorter than 4 bytes — no room for a request ID.
+    #[error("message too short to contain request ID")]
     MessageTooShort,
-}
-
-impl core::fmt::Display for ReqRepError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::IdMismatch { got, expected } => {
-                write!(
-                    f,
-                    "req/rep ID mismatch: got {got:#010x}, expected {expected:#010x}"
-                )
-            }
-            Self::MessageTooShort => write!(f, "message too short to contain request ID"),
-        }
-    }
 }
 
 // ── REQ0 state ────────────────────────────────────────────────────────────────

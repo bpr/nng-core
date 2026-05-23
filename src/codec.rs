@@ -203,18 +203,25 @@ pub fn decode_frame(src: &[u8]) -> Result<(Message, usize), CodecError> {
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 /// Errors that can occur during SP handshake or frame decoding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum CodecError {
     /// The first four bytes were not `\0SP\0`.
+    #[error("invalid SP magic bytes")]
     InvalidMagic,
     /// Handshake bytes 6–7 (reserved) were non-zero.
+    #[error("non-zero reserved bytes in SP handshake")]
     ReservedNotZero,
     /// Remote's protocol ID does not match the expected peer for our protocol.
+    #[error(
+        "incompatible SP protocols: local={:#x} expects peer={:#x}, got {:#x}",
+        local.0, local.expected_peer().0, remote.0
+    )]
     IncompatibleProtocol {
         local: ProtocolId,
         remote: ProtocolId,
     },
     /// Not enough bytes to complete decoding; caller should buffer and retry.
+    #[error("incomplete SP frame (more bytes needed)")]
     Incomplete,
 }
 
@@ -279,22 +286,5 @@ mod kani_proofs {
         let src = len_val.to_be_bytes(); // 8-byte header only, no payload
         let result = decode_frame(&src);
         assert!(matches!(result, Err(CodecError::Incomplete)));
-    }
-}
-
-impl core::fmt::Display for CodecError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::InvalidMagic => write!(f, "invalid SP magic bytes"),
-            Self::ReservedNotZero => write!(f, "non-zero reserved bytes in SP handshake"),
-            Self::IncompatibleProtocol { local, remote } => write!(
-                f,
-                "incompatible SP protocols: local={:#x} expects peer={:#x}, got {:#x}",
-                local.0,
-                local.expected_peer().0,
-                remote.0
-            ),
-            Self::Incomplete => write!(f, "incomplete SP frame (more bytes needed)"),
-        }
     }
 }

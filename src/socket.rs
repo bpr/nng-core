@@ -1145,1551 +1145,180 @@ impl<P> Socket<P> {
     }
 }
 
+// ── Per-protocol method-forwarding macro ─────────────────────────────────────
+//
+// Each socket wrapper type that delegates straight to `Socket` (Push0, Pull0,
+// Pair0, Req0, Rep0) used to carry 5–11 hand-written stub methods that just
+// call `Socket::<method>(addr, ProtocolId::<X>0, …)` and wrap the result.
+// `forward_socket_method!` collapses those stubs to one-liners.  Protocols
+// with bespoke internal state (Pub0, Sub0, Surveyor0, Respondent0, Bus0)
+// don't use this — they have their own implementations.
+//
+// Usage inside an `impl XX { … }` block:
+//
+//     forward_socket_method!(dial,          ProtocolId::PUSH0, tuple);
+//     forward_socket_method!(listen_quic,   ProtocolId::PUSH0, tuple);
+//     forward_socket_method!(dial_kcp_with, ProtocolId::REQ0,  from_socket);
+//
+// The third argument selects how the `Socket<…>` returned by the underlying
+// call is wrapped into `Self`:
+//
+//   - `tuple`       — `.map(Self)` for `pub struct X(Socket<XState>);`
+//   - `from_socket` — `.map(Self::from_socket)` for state-holding wrappers
+//   - `rep0`        — bespoke closure for `pub struct Rep0 { inner, state }`
+//
+// All transport-specific arms emit their own `#[cfg(feature = "…")]` gate,
+// so callers don't repeat it.
+macro_rules! forward_socket_method {
+    // ── plain dial / listen ────────────────────────────────────────────
+    (dial, $proto:expr, $ctor:tt) => {
+        pub async fn dial(addr: &str) -> Result<Self, NngError> {
+            Socket::dial(addr, $proto)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+    (listen, $proto:expr, $ctor:tt) => {
+        pub async fn listen(addr: &str) -> Result<Self, NngError> {
+            Socket::listen(addr, $proto)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+    (dial_reconnecting, $proto:expr, $ctor:tt) => {
+        /// Dial with automatic reconnect using default backoff (100 ms → 30 s).
+        pub async fn dial_reconnecting(addr: &str) -> Result<Self, NngError> {
+            Socket::dial_reconnecting(addr, $proto)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+    (dial_with_reconnect, $proto:expr, $ctor:tt) => {
+        /// Dial with automatic reconnect using custom `ReconnectOptions`.
+        pub async fn dial_with_reconnect(
+            addr: &str,
+            opts: ReconnectOptions,
+        ) -> Result<Self, NngError> {
+            Socket::dial_with_reconnect(addr, $proto, opts)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+
+    // ── tls-tcp ────────────────────────────────────────────────────────
+    (listen_tls_tcp, $proto:expr, $ctor:tt) => {
+        /// Bind a `tls+tcp://` listener.  Requires the `tls-tcp` feature.
+        #[cfg(feature = "tls-tcp")]
+        pub async fn listen_tls_tcp(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> Result<Self, NngError> {
+            Socket::listen_tls_tcp(addr, $proto, cert_pem, key_pem)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+    (dial_tls_tcp, $proto:expr, $ctor:tt) => {
+        /// Dial a `tls+tcp://` server with a custom TLS client config.
+        /// Requires the `tls-tcp` feature.
+        #[cfg(feature = "tls-tcp")]
+        pub async fn dial_tls_tcp(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> Result<Self, NngError> {
+            Socket::dial_tls_tcp(addr, $proto, client_config)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+
+    // ── wss ────────────────────────────────────────────────────────────
+    (listen_tls, $proto:expr, $ctor:tt) => {
+        /// Bind a `wss://` listener.  Requires the `wss` feature.
+        #[cfg(feature = "wss")]
+        pub async fn listen_tls(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> Result<Self, NngError> {
+            Socket::listen_tls(addr, $proto, cert_pem, key_pem)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+
+    // ── quic ───────────────────────────────────────────────────────────
+    (listen_quic, $proto:expr, $ctor:tt) => {
+        /// Bind a `quic://` listener.  Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn listen_quic(
+            addr: &str,
+            cert_pem: &std::path::Path,
+            key_pem: &std::path::Path,
+        ) -> Result<Self, NngError> {
+            Socket::listen_quic(addr, $proto, cert_pem, key_pem)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+    (dial_quic, $proto:expr, $ctor:tt) => {
+        /// Dial a `quic://` server with a custom TLS client config.
+        /// Requires the `quic` feature.
+        #[cfg(feature = "quic")]
+        pub async fn dial_quic(
+            addr: &str,
+            client_config: std::sync::Arc<rustls::ClientConfig>,
+        ) -> Result<Self, NngError> {
+            Socket::dial_quic(addr, $proto, client_config)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+
+    // ── kcp ────────────────────────────────────────────────────────────
+    (listen_kcp_with, $proto:expr, $ctor:tt) => {
+        /// Bind a `kcp://` listener with a caller-supplied `KcpConfig`.
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn listen_kcp_with(
+            addr: &str,
+            config: kcp_tokio::KcpConfig,
+        ) -> Result<Self, NngError> {
+            Socket::listen_kcp_with(addr, $proto, config)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+    (dial_kcp_with, $proto:expr, $ctor:tt) => {
+        /// Dial a `kcp://` server with a caller-supplied `KcpConfig`.
+        /// Requires the `kcp` feature.  Both peers must use the same config.
+        #[cfg(feature = "kcp")]
+        pub async fn dial_kcp_with(
+            addr: &str,
+            config: kcp_tokio::KcpConfig,
+        ) -> Result<Self, NngError> {
+            Socket::dial_kcp_with(addr, $proto, config)
+                .await
+                .map(forward_socket_method!(@map $ctor))
+        }
+    };
+
+    // ── constructor-flavor helpers (internal) ──────────────────────────
+    (@map tuple) => { Self };
+    (@map from_socket) => { Self::from_socket };
+    (@map rep0) => { |s| Self { inner: s, state: Rep0State::new() } };
+}
+
 // ── Protocol modules ──────────────────────────────────────────────────────────
 
-pub mod pubsub0 {
-    //! PUB0 / SUB0 socket API.
-    //!
-    //! `Pub0` listens for subscriber connections and fans out each published
-    //! message to all currently connected subscribers.  `Sub0` dials a
-    //! publisher, registers topic-prefix subscriptions, and reads messages
-    //! that match.
+pub mod pubsub0;
 
-    use crate::{Message, codec::ProtocolId, protocols::pubsub::Sub0State};
+pub mod survey0;
 
-    use super::{
-        AnyListener, AnyTransport, NngError, ReconnectOptions, bind_listener, connect_transport,
-        reconnect_transport,
-    };
-
-    /// Publish socket: listens for subscriber connections, fans out messages.
-    pub struct Pub0 {
-        listener: AnyListener,
-        subscribers: Vec<AnyTransport>,
-    }
-
-    impl Pub0 {
-        /// Bind to `addr` and start accepting subscriber connections.
-        pub async fn listen(addr: &str) -> Result<Self, NngError> {
-            let listener = bind_listener(addr).await?;
-            Ok(Self {
-                listener,
-                subscribers: Vec::new(),
-            })
-        }
-
-        /// Block until at least `n` subscribers have completed the handshake.
-        pub async fn wait_for_subscribers(&mut self, n: usize) -> Result<(), NngError> {
-            while self.subscribers.len() < n {
-                if let Ok(t) = self.listener.accept_as_transport(ProtocolId::PUB0).await {
-                    self.subscribers.push(t);
-                }
-            }
-            Ok(())
-        }
-
-        async fn drain_incoming(&mut self) {
-            loop {
-                // Only the raw OS accept belongs in the biased select: it
-                // returns Pending immediately when the queue is empty, which
-                // is the signal to stop.  The handshake runs outside so it
-                // cannot be dropped mid-flight.
-                let raw = tokio::select! {
-                    biased;
-                    result = self.listener.accept_raw() => match result {
-                        Ok(raw) => raw,
-                        Err(_) => break,
-                    },
-                    _ = std::future::ready(()) => break,
-                };
-                if let Ok(t) = raw.into_transport(ProtocolId::PUB0).await {
-                    self.subscribers.push(t);
-                }
-            }
-        }
-
-        /// Publish `msg` to all connected subscribers.
-        ///
-        /// New connections that arrived since the last publish are accepted
-        /// first.  Subscribers whose connections have broken are silently
-        /// removed.
-        pub async fn publish(&mut self, msg: Message) -> Result<(), NngError> {
-            self.drain_incoming().await;
-            let mut i = 0;
-            while i < self.subscribers.len() {
-                if self.subscribers[i].send(&msg).await.is_err() {
-                    self.subscribers.swap_remove(i);
-                } else {
-                    i += 1;
-                }
-            }
-            Ok(())
-        }
-
-        /// Number of currently connected subscribers.
-        pub fn subscriber_count(&self) -> usize {
-            self.subscribers.len()
-        }
-
-        /// Consume this socket and return a [`futures_sink::Sink`] that
-        /// publishes each flushed message to all connected subscribers.
-        /// Requires the `streams` feature.
-        ///
-        /// The returned sink is `Unpin`; call [`SinkExt`](futures_util::SinkExt)
-        /// methods on it without `pin_mut!`.
-        #[cfg(feature = "streams")]
-        pub fn into_sink(
-            self,
-        ) -> std::pin::Pin<Box<dyn futures_sink::Sink<Message, Error = crate::NngError> + Send>>
-        {
-            Box::pin(futures_util::sink::unfold(
-                self,
-                |mut this: Self, msg: Message| async move {
-                    this.publish(msg).await?;
-                    Ok(this)
-                },
-            ))
-        }
-    }
-
-    /// Subscribe socket: connects to a publisher, filters by topic prefix.
-    pub struct Sub0 {
-        transport: AnyTransport,
-        state: Sub0State,
-        dial_addr: Option<String>,
-        reconnect: Option<ReconnectOptions>,
-    }
-
-    impl Sub0 {
-        /// Connect to the publisher at `addr`.
-        pub async fn dial(addr: &str) -> Result<Self, NngError> {
-            let transport = connect_transport(addr, ProtocolId::SUB0).await?;
-            Ok(Self {
-                transport,
-                state: Sub0State::new(),
-                dial_addr: None,
-                reconnect: None,
-            })
-        }
-
-        /// Dial with automatic reconnect using default backoff (100 ms → 30 s).
-        pub async fn dial_reconnecting(addr: &str) -> Result<Self, NngError> {
-            Self::dial_with_reconnect(addr, ReconnectOptions::default()).await
-        }
-
-        /// Dial with automatic reconnect using custom `ReconnectOptions`.
-        pub async fn dial_with_reconnect(
-            addr: &str,
-            opts: ReconnectOptions,
-        ) -> Result<Self, NngError> {
-            let transport = connect_transport(addr, ProtocolId::SUB0).await?;
-            Ok(Self {
-                transport,
-                state: Sub0State::new(),
-                dial_addr: Some(addr.to_owned()),
-                reconnect: Some(opts),
-            })
-        }
-
-        /// Subscribe to messages whose body starts with `prefix`.
-        ///
-        /// An empty prefix (`b""`) matches every message.  Until at least one
-        /// subscription is added, `next()` will never return.
-        pub fn subscribe_to(&mut self, prefix: &[u8]) {
-            self.state.subscribe(prefix);
-        }
-
-        /// Remove a previously added subscription.
-        pub fn unsubscribe_from(&mut self, prefix: &[u8]) {
-            self.state.unsubscribe(prefix);
-        }
-
-        /// Consume this socket and return a [`futures_core::Stream`] of received
-        /// messages.  Requires the `streams` feature.
-        ///
-        /// The stream ends — yielding the error first — when the transport fails
-        /// permanently (e.g. the publisher disconnects and no reconnect is
-        /// configured).  The returned stream is `Unpin`.
-        #[cfg(feature = "streams")]
-        pub fn into_stream(
-            self,
-        ) -> std::pin::Pin<
-            Box<dyn futures_core::Stream<Item = Result<Message, crate::NngError>> + Send>,
-        > {
-            Box::pin(futures_util::stream::unfold(
-                Some(self),
-                |state| async move {
-                    let mut this = state?;
-                    match this.next().await {
-                        Ok(msg) => Some((Ok(msg), Some(this))),
-                        Err(e) => Some((Err(e), None)),
-                    }
-                },
-            ))
-        }
-
-        /// Return the next message that matches any active subscription.
-        ///
-        /// Non-matching messages are silently discarded.
-        pub async fn next(&mut self) -> Result<Message, NngError> {
-            loop {
-                match self.transport.recv().await {
-                    Ok(msg) => {
-                        if self.state.matches(&msg) {
-                            return Ok(msg);
-                        }
-                    }
-                    Err(e) => {
-                        if let (Some(addr), Some(opts)) = (&self.dial_addr, &self.reconnect) {
-                            let addr = addr.clone();
-                            let opts = opts.clone();
-                            reconnect_transport(
-                                &mut self.transport,
-                                &addr,
-                                ProtocolId::SUB0,
-                                &opts,
-                            )
-                            .await?;
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub mod survey0 {
-    //! SURVEYOR0 / RESPONDENT0 socket API.
-    //!
-    //! The surveyor broadcasts a question to all connected respondents and
-    //! collects answers within a deadline.  The respondent receives surveys
-    //! and may reply via the returned `SurveyHandle`.
-
-    use std::time::Duration;
-
-    use crate::{
-        Message,
-        codec::ProtocolId,
-        protocols::survey::{Respondent0State, SurveyRoutingInfo, Surveyor0State},
-    };
-
-    use super::{
-        AnyListener, AnyTransport, NngError, ReconnectOptions, bind_listener, connect_transport,
-        reconnect_transport,
-    };
-
-    /// Surveyor socket: broadcasts surveys to multiple respondents.
-    pub struct Surveyor0 {
-        listener: AnyListener,
-        respondents: Vec<AnyTransport>,
-        state: Surveyor0State,
-        /// Deadline given to each `survey` call.  Matches NNG's `NNG_OPT_SURVEYOR_SURVEYTIME`.
-        survey_time: Duration,
-    }
-
-    impl Surveyor0 {
-        /// Bind and start accepting respondent connections.
-        pub async fn listen(addr: &str) -> Result<Self, NngError> {
-            let listener = bind_listener(addr).await?;
-            Ok(Self {
-                listener,
-                respondents: Vec::new(),
-                state: Surveyor0State::new(),
-                survey_time: Duration::from_secs(1),
-            })
-        }
-
-        /// Set the default survey deadline used by `survey()`.
-        ///
-        /// Equivalent to NNG's `NNG_OPT_SURVEYOR_SURVEYTIME`.  Defaults to 1 second.
-        pub fn set_survey_time(&mut self, d: Duration) {
-            self.survey_time = d;
-        }
-
-        /// Block until at least `n` respondents have connected.
-        pub async fn wait_for_respondents(&mut self, n: usize) -> Result<(), NngError> {
-            while self.respondents.len() < n {
-                if let Ok(t) = self
-                    .listener
-                    .accept_as_transport(ProtocolId::SURVEYOR0)
-                    .await
-                {
-                    self.respondents.push(t);
-                }
-            }
-            Ok(())
-        }
-
-        /// Accept any respondents that connected since the last call.
-        ///
-        /// Returns immediately when the kernel's accept queue is empty.
-        pub async fn accept_pending(&mut self) {
-            loop {
-                let raw = tokio::select! {
-                    biased;
-                    result = self.listener.accept_raw() => match result {
-                        Ok(raw) => raw,
-                        Err(_) => break,
-                    },
-                    _ = std::future::ready(()) => break,
-                };
-                if let Ok(t) = raw.into_transport(ProtocolId::SURVEYOR0).await {
-                    self.respondents.push(t);
-                }
-            }
-        }
-
-        /// Broadcast `msg` as a survey; collect all responses arriving within
-        /// `self.survey_time`.  Returns the application-level response messages.
-        pub async fn survey(&mut self, msg: Message) -> Result<Vec<Message>, NngError> {
-            self.survey_with_timeout(msg, self.survey_time).await
-        }
-
-        /// Broadcast `msg` as a survey; collect all responses arriving within
-        /// `timeout`.  All respondents are polled **concurrently** — a slow
-        /// respondent does not starve the others.
-        pub async fn survey_with_timeout(
-            &mut self,
-            msg: Message,
-            timeout: Duration,
-        ) -> Result<Vec<Message>, NngError> {
-            let mut outgoing = msg;
-            self.state.prepare_survey(&mut outgoing);
-
-            let deadline = tokio::time::Instant::now() + timeout;
-
-            let mut pending: Vec<usize> = Vec::new();
-            for (i, resp) in self.respondents.iter_mut().enumerate() {
-                if resp.send(&outgoing).await.is_ok() {
-                    pending.push(i);
-                }
-            }
-
-            let mut responses = Vec::new();
-
-            // Poll all pending respondents concurrently within the shared deadline.
-            // FramedTransport::recv is cancellation-safe (state stored in RecvBuf),
-            // so dropping a half-polled future and retrying is correct.
-            'outer: loop {
-                if pending.is_empty() {
-                    break;
-                }
-
-                let mut still_pending = Vec::new();
-                for &i in &pending {
-                    let result = tokio::select! {
-                        biased;
-                        r = self.respondents[i].recv() => Some(r),
-                        _ = std::future::ready(()) => None,
-                    };
-                    match result {
-                        Some(Ok(mut raw)) => {
-                            if self.state.process_response(&mut raw).is_ok() {
-                                responses.push(raw);
-                            }
-                        }
-                        Some(Err(_)) => {}
-                        None => still_pending.push(i),
-                    }
-                }
-                pending = still_pending;
-
-                if pending.is_empty() {
-                    break;
-                }
-
-                // Yield once so the runtime can service I/O, then check deadline.
-                tokio::select! {
-                    biased;
-                    _ = tokio::time::sleep_until(deadline) => break 'outer,
-                    _ = tokio::task::yield_now() => continue,
-                }
-            }
-
-            Ok(responses)
-        }
-    }
-
-    /// One-shot handle that allows sending a single response to the active survey.
-    pub struct SurveyHandle<'a> {
-        transport: &'a mut AnyTransport,
-        routing: SurveyRoutingInfo,
-    }
-
-    impl<'a> SurveyHandle<'a> {
-        /// Send a response to the surveyor.
-        pub async fn respond(self, msg: Message) -> Result<(), NngError> {
-            let state = Respondent0State::new();
-            let mut outgoing = msg;
-            state.prepare_response(&mut outgoing, &self.routing);
-            self.transport.send(&outgoing).await
-        }
-    }
-
-    /// Respondent socket: dials a surveyor, receives surveys, sends responses.
-    pub struct Respondent0 {
-        transport: AnyTransport,
-        state: Respondent0State,
-        dial_addr: Option<String>,
-        reconnect: Option<ReconnectOptions>,
-    }
-
-    impl Respondent0 {
-        /// Connect to a surveyor at `addr`.
-        pub async fn dial(addr: &str) -> Result<Self, NngError> {
-            let transport = connect_transport(addr, ProtocolId::RESPONDENT0).await?;
-            Ok(Self {
-                transport,
-                state: Respondent0State::new(),
-                dial_addr: None,
-                reconnect: None,
-            })
-        }
-
-        /// Dial with automatic reconnect using default backoff (100 ms → 30 s).
-        pub async fn dial_reconnecting(addr: &str) -> Result<Self, NngError> {
-            Self::dial_with_reconnect(addr, ReconnectOptions::default()).await
-        }
-
-        /// Dial with automatic reconnect using custom `ReconnectOptions`.
-        pub async fn dial_with_reconnect(
-            addr: &str,
-            opts: ReconnectOptions,
-        ) -> Result<Self, NngError> {
-            let transport = connect_transport(addr, ProtocolId::RESPONDENT0).await?;
-            Ok(Self {
-                transport,
-                state: Respondent0State::new(),
-                dial_addr: Some(addr.to_owned()),
-                reconnect: Some(opts),
-            })
-        }
-
-        /// Receive the next survey.  Returns the application message and a
-        /// `SurveyHandle` that must be used to respond (or dropped to skip).
-        pub async fn receive(&mut self) -> Result<(Message, SurveyHandle<'_>), NngError> {
-            let mut msg = loop {
-                match self.transport.recv().await {
-                    Ok(m) => break m,
-                    Err(e) => {
-                        if let (Some(addr), Some(opts)) = (&self.dial_addr, &self.reconnect) {
-                            let addr = addr.clone();
-                            let opts = opts.clone();
-                            reconnect_transport(
-                                &mut self.transport,
-                                &addr,
-                                ProtocolId::RESPONDENT0,
-                                &opts,
-                            )
-                            .await?;
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
-            };
-            let routing = self
-                .state
-                .process_incoming(&mut msg)
-                .map_err(|e| NngError::ProtocolViolation(e.to_string()))?;
-            Ok((
-                msg,
-                SurveyHandle {
-                    transport: &mut self.transport,
-                    routing,
-                },
-            ))
-        }
-    }
-}
-
-pub mod bus0 {
-    //! BUS0 socket API — many-to-many broadcast.
-    //!
-    //! Every `Bus0` node can broadcast messages to all connected peers and
-    //! receive from any of them.  BUS is stateless at the protocol level.
-    //!
-    //! `recv_any` polls peers in round-robin with cooperative yielding.  It is
-    //! safe to cancel between iterations because `FramedTransport::recv` is
-    //! cancellation-safe: any bytes already read from the stream are preserved
-    //! in the transport's internal `RecvBuf` and resumed on the next call.
-    //! For WebSocket peers, `WsTransport::recv` is also cancellation-safe
-    //! because tungstenite reassembles frames internally before yielding.
-    //!
-    //! [`RecvBuf`]: crate::transport::FramedTransport
-    //! [`Pull0Fan`]: super::pipeline0::Pull0Fan
-
-    use crate::{Message, codec::ProtocolId};
-
-    use super::{AnyListener, AnyTransport, NngError, bind_listener, connect_transport};
-
-    /// A BUS0 node that can be connected to any number of peers.
-    ///
-    /// When constructed via [`listen`](Self::listen) or
-    /// [`listen_and_accept`](Self::listen_and_accept), the OS listener socket
-    /// is kept open so that [`accept_pending`](Self::accept_pending) can admit
-    /// new peers at any time after construction.
-    pub struct Bus0 {
-        /// Present when this node bound a listener; `None` for dialled nodes.
-        listener: Option<AnyListener>,
-        peers: Vec<AnyTransport>,
-    }
-
-    impl Bus0 {
-        /// Bind and accept exactly one peer connection.
-        pub async fn listen(addr: &str) -> Result<Self, NngError> {
-            Self::listen_and_accept(addr, 1).await
-        }
-
-        /// Bind and accept `n` peer connections before returning.
-        ///
-        /// The listener socket is **kept open** so that
-        /// [`accept_pending`](Self::accept_pending) can admit peers that
-        /// connect after this call returns.
-        pub async fn listen_and_accept(addr: &str, n: usize) -> Result<Self, NngError> {
-            let listener = bind_listener(addr).await?;
-            let mut peers = Vec::with_capacity(n);
-            while peers.len() < n {
-                if let Ok(t) = listener.accept_as_transport(ProtocolId::BUS0).await {
-                    peers.push(t);
-                }
-            }
-            Ok(Self {
-                listener: Some(listener),
-                peers,
-            })
-        }
-
-        /// Dial one peer and return a `Bus0` with that single connection.
-        pub async fn dial(addr: &str) -> Result<Self, NngError> {
-            let transport = connect_transport(addr, ProtocolId::BUS0).await?;
-            Ok(Self {
-                listener: None,
-                peers: vec![transport],
-            })
-        }
-
-        /// Accept any peers whose connections arrived since the last call.
-        ///
-        /// Returns immediately when the kernel accept queue is empty.  Only
-        /// has an effect on nodes created with [`listen`](Self::listen) or
-        /// [`listen_and_accept`](Self::listen_and_accept).
-        pub async fn accept_pending(&mut self) {
-            let Some(listener) = &self.listener else {
-                return;
-            };
-            loop {
-                let raw = tokio::select! {
-                    biased;
-                    result = listener.accept_raw() => match result {
-                        Ok(raw) => raw,
-                        Err(_) => break,
-                    },
-                    _ = std::future::ready(()) => break,
-                };
-                if let Ok(t) = raw.into_transport(ProtocolId::BUS0).await {
-                    self.peers.push(t);
-                }
-            }
-        }
-
-        /// Broadcast `msg` to all connected peers.  Best-effort: broken
-        /// connections are silently removed.
-        pub async fn broadcast(&mut self, msg: Message) -> Result<(), NngError> {
-            let mut i = 0;
-            while i < self.peers.len() {
-                if self.peers[i].send(&msg).await.is_err() {
-                    self.peers.swap_remove(i);
-                } else {
-                    i += 1;
-                }
-            }
-            Ok(())
-        }
-
-        /// Receive the next message from any connected peer.
-        ///
-        /// Polls peers in round-robin order with cooperative yielding between
-        /// passes.
-        pub async fn recv_any(&mut self) -> Result<Message, NngError> {
-            loop {
-                if self.peers.is_empty() {
-                    return Err(NngError::NoPeers);
-                }
-                let mut i = 0;
-                while i < self.peers.len() {
-                    let poll_result = tokio::select! {
-                        biased;
-                        result = self.peers[i].recv() => Some(result),
-                        _ = std::future::ready(()) => None,
-                    };
-                    match poll_result {
-                        Some(Ok(msg)) => return Ok(msg),
-                        Some(Err(_)) => {
-                            self.peers.swap_remove(i);
-                        }
-                        None => {
-                            i += 1;
-                        }
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-        }
-
-        /// Receive from a specific peer by index.
-        pub async fn recv_from(&mut self, peer_idx: usize) -> Result<Message, NngError> {
-            self.peers
-                .get_mut(peer_idx)
-                .ok_or(NngError::NoPeers)?
-                .recv()
-                .await
-        }
-
-        /// Number of currently connected peers.
-        pub fn peer_count(&self) -> usize {
-            self.peers.len()
-        }
-    }
-}
-
-pub mod pipeline0 {
-    //! PUSH0 / PULL0 socket API (pipeline pattern).
-    //!
-    //! `Push0` / `Pull0` handle a single connection each.  `Push0Fan` and
-    //! `Pull0Fan` handle N connections: `Push0Fan` round-robins outgoing
-    //! messages across N pullers; `Pull0Fan` receives from whichever of N
-    //! pushers has data available first.
-
-    use crate::{
-        Message,
-        codec::ProtocolId,
-        protocols::pipeline::{Pull0State, Push0State},
-        socket::{NngError, ReconnectOptions, Socket},
-    };
-
-    use super::{AnyTransport, bind_listener};
-
-    /// Push socket: sends messages to a single connected pull endpoint.
-    pub struct Push0(Socket<Push0State>);
-
-    impl Push0 {
-        pub async fn listen(addr: &str) -> Result<Self, NngError> {
-            Socket::listen(addr, ProtocolId::PUSH0).await.map(Self)
-        }
-
-        #[cfg(feature = "wss")]
-        pub async fn listen_tls(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_tls(addr, ProtocolId::PUSH0, cert_pem, key_pem)
-                .await
-                .map(Self)
-        }
-
-        #[cfg(feature = "tls-tcp")]
-        pub async fn listen_tls_tcp(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_tls_tcp(addr, ProtocolId::PUSH0, cert_pem, key_pem)
-                .await
-                .map(Self)
-        }
-
-        #[cfg(feature = "tls-tcp")]
-        pub async fn dial_tls_tcp(
-            addr: &str,
-            client_config: std::sync::Arc<rustls::ClientConfig>,
-        ) -> Result<Self, NngError> {
-            Socket::dial_tls_tcp(addr, ProtocolId::PUSH0, client_config)
-                .await
-                .map(Self)
-        }
-
-        /// Bind a QUIC endpoint and wait for the first pull connection.
-        ///
-        /// `addr` must be a `quic://host:port` URL. `cert_pem` and `key_pem`
-        /// are paths to the server's PEM certificate and private key.
-        /// Requires the `quic` feature.
-        #[cfg(feature = "quic")]
-        pub async fn listen_quic(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_quic(addr, ProtocolId::PUSH0, cert_pem, key_pem)
-                .await
-                .map(Self)
-        }
-
-        /// Dial a QUIC pull server with a custom TLS client configuration.
-        ///
-        /// `addr` must be a `quic://host:port` URL. Use this when connecting
-        /// to a server with a self-signed certificate; for CA-signed
-        /// certificates use [`dial`](Self::dial) with a `quic://` URL instead.
-        /// Requires the `quic` feature.
-        #[cfg(feature = "quic")]
-        pub async fn dial_quic(
-            addr: &str,
-            client_config: std::sync::Arc<rustls::ClientConfig>,
-        ) -> Result<Self, NngError> {
-            Socket::dial_quic(addr, ProtocolId::PUSH0, client_config)
-                .await
-                .map(Self)
-        }
-
-        /// Bind a `kcp://` listener with a caller-supplied [`kcp_tokio::KcpConfig`].
-        /// Requires the `kcp` feature.  Both peers must use the same config.
-        #[cfg(feature = "kcp")]
-        pub async fn listen_kcp_with(
-            addr: &str,
-            config: kcp_tokio::KcpConfig,
-        ) -> Result<Self, NngError> {
-            Socket::listen_kcp_with(addr, ProtocolId::PUSH0, config)
-                .await
-                .map(Self)
-        }
-
-        /// Dial a `kcp://` server with a caller-supplied [`kcp_tokio::KcpConfig`].
-        /// Requires the `kcp` feature.  Both peers must use the same config.
-        #[cfg(feature = "kcp")]
-        pub async fn dial_kcp_with(
-            addr: &str,
-            config: kcp_tokio::KcpConfig,
-        ) -> Result<Self, NngError> {
-            Socket::dial_kcp_with(addr, ProtocolId::PUSH0, config)
-                .await
-                .map(Self)
-        }
-
-        pub async fn dial(addr: &str) -> Result<Self, NngError> {
-            Socket::dial(addr, ProtocolId::PUSH0).await.map(Self)
-        }
-
-        /// Dial with automatic reconnect using default backoff (100 ms → 30 s).
-        pub async fn dial_reconnecting(addr: &str) -> Result<Self, NngError> {
-            Socket::dial_reconnecting(addr, ProtocolId::PUSH0)
-                .await
-                .map(Self)
-        }
-
-        /// Dial with automatic reconnect using custom `ReconnectOptions`.
-        pub async fn dial_with_reconnect(
-            addr: &str,
-            opts: ReconnectOptions,
-        ) -> Result<Self, NngError> {
-            Socket::dial_with_reconnect(addr, ProtocolId::PUSH0, opts)
-                .await
-                .map(Self)
-        }
-
-        pub async fn push(&mut self, msg: Message) -> Result<(), NngError> {
-            self.0.send_raw(&msg).await
-        }
-
-        /// Consume this socket and return a [`futures_sink::Sink`] that sends
-        /// each flushed message to the connected pull endpoint.
-        /// Requires the `streams` feature.
-        ///
-        /// The returned sink is `Unpin`.
-        #[cfg(feature = "streams")]
-        pub fn into_sink(
-            self,
-        ) -> std::pin::Pin<Box<dyn futures_sink::Sink<Message, Error = crate::NngError> + Send>>
-        {
-            Box::pin(futures_util::sink::unfold(
-                self,
-                |mut this: Self, msg: Message| async move {
-                    this.push(msg).await?;
-                    Ok(this)
-                },
-            ))
-        }
-    }
-
-    /// Pull socket: receives messages from a single connected push endpoint.
-    pub struct Pull0(Socket<Pull0State>);
-
-    impl Pull0 {
-        pub async fn listen(addr: &str) -> Result<Self, NngError> {
-            Socket::listen(addr, ProtocolId::PULL0).await.map(Self)
-        }
-
-        #[cfg(feature = "wss")]
-        pub async fn listen_tls(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_tls(addr, ProtocolId::PULL0, cert_pem, key_pem)
-                .await
-                .map(Self)
-        }
-
-        #[cfg(feature = "tls-tcp")]
-        pub async fn listen_tls_tcp(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_tls_tcp(addr, ProtocolId::PULL0, cert_pem, key_pem)
-                .await
-                .map(Self)
-        }
-
-        #[cfg(feature = "tls-tcp")]
-        pub async fn dial_tls_tcp(
-            addr: &str,
-            client_config: std::sync::Arc<rustls::ClientConfig>,
-        ) -> Result<Self, NngError> {
-            Socket::dial_tls_tcp(addr, ProtocolId::PULL0, client_config)
-                .await
-                .map(Self)
-        }
-
-        /// Bind a QUIC endpoint and wait for the first push connection.
-        ///
-        /// `addr` must be a `quic://host:port` URL. `cert_pem` and `key_pem`
-        /// are paths to the server's PEM certificate and private key.
-        /// Requires the `quic` feature.
-        #[cfg(feature = "quic")]
-        pub async fn listen_quic(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_quic(addr, ProtocolId::PULL0, cert_pem, key_pem)
-                .await
-                .map(Self)
-        }
-
-        /// Dial a QUIC push server with a custom TLS client configuration.
-        ///
-        /// `addr` must be a `quic://host:port` URL. Use this when connecting
-        /// to a server with a self-signed certificate; for CA-signed
-        /// certificates use [`dial`](Self::dial) with a `quic://` URL instead.
-        /// Requires the `quic` feature.
-        #[cfg(feature = "quic")]
-        pub async fn dial_quic(
-            addr: &str,
-            client_config: std::sync::Arc<rustls::ClientConfig>,
-        ) -> Result<Self, NngError> {
-            Socket::dial_quic(addr, ProtocolId::PULL0, client_config)
-                .await
-                .map(Self)
-        }
-
-        /// Bind a `kcp://` listener with a caller-supplied [`kcp_tokio::KcpConfig`].
-        /// Requires the `kcp` feature.  Both peers must use the same config.
-        #[cfg(feature = "kcp")]
-        pub async fn listen_kcp_with(
-            addr: &str,
-            config: kcp_tokio::KcpConfig,
-        ) -> Result<Self, NngError> {
-            Socket::listen_kcp_with(addr, ProtocolId::PULL0, config)
-                .await
-                .map(Self)
-        }
-
-        /// Dial a `kcp://` server with a caller-supplied [`kcp_tokio::KcpConfig`].
-        /// Requires the `kcp` feature.  Both peers must use the same config.
-        #[cfg(feature = "kcp")]
-        pub async fn dial_kcp_with(
-            addr: &str,
-            config: kcp_tokio::KcpConfig,
-        ) -> Result<Self, NngError> {
-            Socket::dial_kcp_with(addr, ProtocolId::PULL0, config)
-                .await
-                .map(Self)
-        }
-
-        pub async fn dial(addr: &str) -> Result<Self, NngError> {
-            Socket::dial(addr, ProtocolId::PULL0).await.map(Self)
-        }
-
-        /// Dial with automatic reconnect using default backoff (100 ms → 30 s).
-        pub async fn dial_reconnecting(addr: &str) -> Result<Self, NngError> {
-            Socket::dial_reconnecting(addr, ProtocolId::PULL0)
-                .await
-                .map(Self)
-        }
-
-        /// Dial with automatic reconnect using custom `ReconnectOptions`.
-        pub async fn dial_with_reconnect(
-            addr: &str,
-            opts: ReconnectOptions,
-        ) -> Result<Self, NngError> {
-            Socket::dial_with_reconnect(addr, ProtocolId::PULL0, opts)
-                .await
-                .map(Self)
-        }
-
-        pub async fn pull(&mut self) -> Result<Message, NngError> {
-            self.0.recv_raw().await
-        }
-
-        /// Consume this socket and return a [`futures_core::Stream`] of received
-        /// messages.  Requires the `streams` feature.
-        ///
-        /// The stream ends — yielding the error first — when the transport fails.
-        /// The returned stream is `Unpin`; use [`StreamExt`](futures_util::StreamExt)
-        /// combinators on it without `pin_mut!`.
-        #[cfg(feature = "streams")]
-        pub fn into_stream(
-            self,
-        ) -> std::pin::Pin<
-            Box<dyn futures_core::Stream<Item = Result<Message, crate::NngError>> + Send>,
-        > {
-            Box::pin(futures_util::stream::unfold(
-                Some(self),
-                |state| async move {
-                    let mut this = state?;
-                    match this.pull().await {
-                        Ok(msg) => Some((Ok(msg), Some(this))),
-                        Err(e) => Some((Err(e), None)),
-                    }
-                },
-            ))
-        }
-    }
-
-    /// Multi-worker push socket: distributes messages across N connected
-    /// pullers in round-robin order.
-    pub struct Push0Fan {
-        workers: Vec<AnyTransport>,
-        next: usize,
-    }
-
-    impl Push0Fan {
-        /// Bind to `addr` and block until exactly `n` PULL connections have
-        /// completed the handshake.
-        pub async fn listen_and_accept(addr: &str, n: usize) -> Result<Self, NngError> {
-            let listener = bind_listener(addr).await?;
-            let mut workers = Vec::with_capacity(n);
-            while workers.len() < n {
-                if let Ok(t) = listener.accept_as_transport(ProtocolId::PUSH0).await {
-                    workers.push(t);
-                }
-            }
-            Ok(Self { workers, next: 0 })
-        }
-
-        /// Send `msg` to the next worker in round-robin order.
-        pub async fn push(&mut self, msg: Message) -> Result<(), NngError> {
-            if self.workers.is_empty() {
-                return Err(NngError::NoPeers);
-            }
-            let i = self.next;
-            self.next = (self.next + 1) % self.workers.len();
-            self.workers[i].send(&msg).await
-        }
-
-        /// Number of connected workers.
-        pub fn worker_count(&self) -> usize {
-            self.workers.len()
-        }
-    }
-
-    /// Multi-sender pull socket: accepts N pushers and receives from whichever
-    /// has data available first.
-    ///
-    /// Each connected sender runs in its own tokio task so `recv` is never
-    /// cancelled mid-read.  Dropping `Pull0Fan` cancels all background tasks
-    /// promptly, even if their peers are idle.
-    pub struct Pull0Fan {
-        rx: tokio::sync::mpsc::Receiver<Result<Message, NngError>>,
-        n: usize,
-        /// Dropping this sender closes the watch channel, which unblocks every
-        /// background task's `cancel.changed()` call and causes it to exit.
-        _shutdown: tokio::sync::watch::Sender<()>,
-    }
-
-    impl Pull0Fan {
-        /// Bind to `addr` and block until exactly `n` PUSH connections have
-        /// completed the handshake.
-        pub async fn listen_and_accept(addr: &str, n: usize) -> Result<Self, NngError> {
-            let listener = bind_listener(addr).await?;
-            let (tx, rx) = tokio::sync::mpsc::channel(n * 4);
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-            let mut count = 0;
-            while count < n {
-                if let Ok(mut transport) = listener.accept_as_transport(ProtocolId::PULL0).await {
-                    let tx2 = tx.clone();
-                    let mut cancel = shutdown_rx.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                result = transport.recv() => {
-                                    match result {
-                                        Ok(msg) => {
-                                            if tx2.send(Ok(msg)).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = tx2.send(Err(e)).await;
-                                            break;
-                                        }
-                                    }
-                                }
-                                // Fires (with Err) when the Pull0Fan is dropped and
-                                // the shutdown_tx Sender is closed.
-                                _ = cancel.changed() => break,
-                            }
-                        }
-                    });
-                    count += 1;
-                }
-            }
-            Ok(Self {
-                rx,
-                n,
-                _shutdown: shutdown_tx,
-            })
-        }
-
-        /// Receive the next message from any connected sender.
-        ///
-        /// Skips sender-disconnect errors so callers keep receiving from the
-        /// remaining live senders.  Returns `Err` only when all senders are gone.
-        pub async fn pull_any(&mut self) -> Result<Message, NngError> {
-            loop {
-                match self.rx.recv().await {
-                    None => return Err(NngError::NoPeers),
-                    Some(Ok(msg)) => return Ok(msg),
-                    Some(Err(_)) => {}
-                }
-            }
-        }
-
-        /// Number of senders accepted at construction time.
-        pub fn sender_count(&self) -> usize {
-            self.n
-        }
-    }
-
-    /// [`Pull0Fan`] implements [`futures_core::Stream`] directly, mirroring
-    /// [`Pull0Fan::pull_any`]: individual sender-disconnect errors are skipped
-    /// transparently, and the stream ends (yields `None`) only when all sender
-    /// tasks have exited and the channel is drained.
-    ///
-    /// Requires the `streams` feature.
-    #[cfg(feature = "streams")]
-    impl futures_core::Stream for Pull0Fan {
-        type Item = Message;
-
-        fn poll_next(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Self::Item>> {
-            loop {
-                match self.rx.poll_recv(cx) {
-                    std::task::Poll::Ready(Some(Ok(msg))) => {
-                        return std::task::Poll::Ready(Some(msg));
-                    }
-                    std::task::Poll::Ready(Some(Err(_))) => {
-                        // A single sender disconnected — skip and poll again.
-                        continue;
-                    }
-                    std::task::Poll::Ready(None) => {
-                        // All sender tasks have exited; the stream is done.
-                        return std::task::Poll::Ready(None);
-                    }
-                    std::task::Poll::Pending => return std::task::Poll::Pending,
-                }
-            }
-        }
-    }
-}
-
-pub mod pair0 {
-    //! PAIR0 socket API (bidirectional point-to-point).
-    //!
-    //! Both ends can send and receive freely with no protocol headers.
-
-    use crate::{
-        Message,
-        codec::ProtocolId,
-        protocols::pair::Pair0State,
-        socket::{NngError, ReconnectOptions, Socket},
-    };
-
-    /// Pair socket: bidirectional point-to-point messaging.
-    pub struct Pair0(Socket<Pair0State>);
-
-    impl Pair0 {
-        pub async fn listen(addr: &str) -> Result<Self, NngError> {
-            Socket::listen(addr, ProtocolId::PAIR0).await.map(Self)
-        }
-
-        #[cfg(feature = "wss")]
-        pub async fn listen_tls(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_tls(addr, ProtocolId::PAIR0, cert_pem, key_pem)
-                .await
-                .map(Self)
-        }
-
-        #[cfg(feature = "tls-tcp")]
-        pub async fn listen_tls_tcp(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_tls_tcp(addr, ProtocolId::PAIR0, cert_pem, key_pem)
-                .await
-                .map(Self)
-        }
-
-        #[cfg(feature = "tls-tcp")]
-        pub async fn dial_tls_tcp(
-            addr: &str,
-            client_config: std::sync::Arc<rustls::ClientConfig>,
-        ) -> Result<Self, NngError> {
-            Socket::dial_tls_tcp(addr, ProtocolId::PAIR0, client_config)
-                .await
-                .map(Self)
-        }
-
-        /// Bind a QUIC endpoint and wait for the peer connection.
-        ///
-        /// `addr` must be a `quic://host:port` URL. `cert_pem` and `key_pem`
-        /// are paths to the server's PEM certificate and private key.
-        /// Requires the `quic` feature.
-        #[cfg(feature = "quic")]
-        pub async fn listen_quic(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_quic(addr, ProtocolId::PAIR0, cert_pem, key_pem)
-                .await
-                .map(Self)
-        }
-
-        /// Dial a QUIC pair peer with a custom TLS client configuration.
-        ///
-        /// `addr` must be a `quic://host:port` URL. Use this when connecting
-        /// to a peer with a self-signed certificate; for CA-signed
-        /// certificates use [`dial`](Self::dial) with a `quic://` URL instead.
-        /// Requires the `quic` feature.
-        #[cfg(feature = "quic")]
-        pub async fn dial_quic(
-            addr: &str,
-            client_config: std::sync::Arc<rustls::ClientConfig>,
-        ) -> Result<Self, NngError> {
-            Socket::dial_quic(addr, ProtocolId::PAIR0, client_config)
-                .await
-                .map(Self)
-        }
-
-        /// Bind a `kcp://` listener with a caller-supplied [`kcp_tokio::KcpConfig`].
-        /// Requires the `kcp` feature.  Both peers must use the same config.
-        #[cfg(feature = "kcp")]
-        pub async fn listen_kcp_with(
-            addr: &str,
-            config: kcp_tokio::KcpConfig,
-        ) -> Result<Self, NngError> {
-            Socket::listen_kcp_with(addr, ProtocolId::PAIR0, config)
-                .await
-                .map(Self)
-        }
-
-        /// Dial a `kcp://` peer with a caller-supplied [`kcp_tokio::KcpConfig`].
-        /// Requires the `kcp` feature.  Both peers must use the same config.
-        #[cfg(feature = "kcp")]
-        pub async fn dial_kcp_with(
-            addr: &str,
-            config: kcp_tokio::KcpConfig,
-        ) -> Result<Self, NngError> {
-            Socket::dial_kcp_with(addr, ProtocolId::PAIR0, config)
-                .await
-                .map(Self)
-        }
-
-        pub async fn dial(addr: &str) -> Result<Self, NngError> {
-            Socket::dial(addr, ProtocolId::PAIR0).await.map(Self)
-        }
-
-        /// Dial with automatic reconnect using default backoff (100 ms → 30 s).
-        pub async fn dial_reconnecting(addr: &str) -> Result<Self, NngError> {
-            Socket::dial_reconnecting(addr, ProtocolId::PAIR0)
-                .await
-                .map(Self)
-        }
-
-        /// Dial with automatic reconnect using custom `ReconnectOptions`.
-        pub async fn dial_with_reconnect(
-            addr: &str,
-            opts: ReconnectOptions,
-        ) -> Result<Self, NngError> {
-            Socket::dial_with_reconnect(addr, ProtocolId::PAIR0, opts)
-                .await
-                .map(Self)
-        }
-
-        pub async fn send(&mut self, msg: Message) -> Result<(), NngError> {
-            self.0.send_raw(&msg).await
-        }
-
-        pub async fn recv(&mut self) -> Result<Message, NngError> {
-            self.0.recv_raw().await
-        }
-
-        /// Consume this socket and return a [`futures_core::Stream`] of
-        /// received messages.  Requires the `streams` feature.
-        ///
-        /// The stream ends — yielding the error first — when the peer
-        /// disconnects.  The returned stream is `Unpin`.
-        #[cfg(feature = "streams")]
-        pub fn into_stream(
-            self,
-        ) -> std::pin::Pin<
-            Box<dyn futures_core::Stream<Item = Result<Message, crate::NngError>> + Send>,
-        > {
-            Box::pin(futures_util::stream::unfold(
-                Some(self),
-                |state| async move {
-                    let mut this = state?;
-                    match this.recv().await {
-                        Ok(msg) => Some((Ok(msg), Some(this))),
-                        Err(e) => Some((Err(e), None)),
-                    }
-                },
-            ))
-        }
-
-        /// Consume this socket and return a [`futures_sink::Sink`] that sends
-        /// each flushed message to the connected peer.
-        /// Requires the `streams` feature.
-        ///
-        /// The returned sink is `Unpin`.
-        #[cfg(feature = "streams")]
-        pub fn into_sink(
-            self,
-        ) -> std::pin::Pin<Box<dyn futures_sink::Sink<Message, Error = crate::NngError> + Send>>
-        {
-            Box::pin(futures_util::sink::unfold(
-                self,
-                |mut this: Self, msg: Message| async move {
-                    this.send(msg).await?;
-                    Ok(this)
-                },
-            ))
-        }
-    }
-}
-
-pub mod reqrep0 {
-    //! REQ0 / REP0 socket API.
-
-    use std::time::Duration;
-
-    use crate::{
-        Message,
-        codec::ProtocolId,
-        protocols::reqrep::{Rep0State, Req0State, ReqRepError, RoutingInfo},
-        socket::{NngError, ReconnectOptions, Socket},
-    };
-
-    /// Request socket: connects to a reply server, sends requests, awaits replies.
-    ///
-    /// The request ID counter is per-socket and increments across calls, so a
-    /// stale reply from a previous call is detected and silently discarded.
-    pub struct Req0 {
-        inner: Socket<Req0State>,
-        state: Req0State,
-        /// When `Some`, the request is resent after this interval if no reply
-        /// arrives.  Equivalent to NNG's `NNG_OPT_REQ_RESENDTIME`.
-        resend_time: Option<Duration>,
-    }
-
-    impl Req0 {
-        fn from_socket(inner: Socket<Req0State>) -> Self {
-            Self {
-                inner,
-                state: Req0State::new(),
-                resend_time: None,
-            }
-        }
-
-        pub async fn dial(addr: &str) -> Result<Self, NngError> {
-            Socket::dial(addr, ProtocolId::REQ0)
-                .await
-                .map(Self::from_socket)
-        }
-
-        /// Dial with automatic reconnect using default backoff (100 ms → 30 s).
-        pub async fn dial_reconnecting(addr: &str) -> Result<Self, NngError> {
-            Socket::dial_reconnecting(addr, ProtocolId::REQ0)
-                .await
-                .map(Self::from_socket)
-        }
-
-        /// Dial with automatic reconnect using custom `ReconnectOptions`.
-        pub async fn dial_with_reconnect(
-            addr: &str,
-            opts: ReconnectOptions,
-        ) -> Result<Self, NngError> {
-            Socket::dial_with_reconnect(addr, ProtocolId::REQ0, opts)
-                .await
-                .map(Self::from_socket)
-        }
-
-        #[cfg(feature = "tls-tcp")]
-        pub async fn dial_tls_tcp(
-            addr: &str,
-            client_config: std::sync::Arc<rustls::ClientConfig>,
-        ) -> Result<Self, NngError> {
-            Socket::dial_tls_tcp(addr, ProtocolId::REQ0, client_config)
-                .await
-                .map(Self::from_socket)
-        }
-
-        /// Dial a QUIC reply server with a custom TLS client configuration.
-        ///
-        /// `addr` must be a `quic://host:port` URL. Use this when connecting
-        /// to a server with a self-signed certificate; for CA-signed
-        /// certificates use [`dial`](Self::dial) with a `quic://` URL instead.
-        /// Requires the `quic` feature.
-        #[cfg(feature = "quic")]
-        pub async fn dial_quic(
-            addr: &str,
-            client_config: std::sync::Arc<rustls::ClientConfig>,
-        ) -> Result<Self, NngError> {
-            Socket::dial_quic(addr, ProtocolId::REQ0, client_config)
-                .await
-                .map(Self::from_socket)
-        }
-
-        /// Dial a `kcp://` server with a caller-supplied [`kcp_tokio::KcpConfig`].
-        /// Requires the `kcp` feature.  Both peers must use the same config.
-        #[cfg(feature = "kcp")]
-        pub async fn dial_kcp_with(
-            addr: &str,
-            config: kcp_tokio::KcpConfig,
-        ) -> Result<Self, NngError> {
-            Socket::dial_kcp_with(addr, ProtocolId::REQ0, config)
-                .await
-                .map(Self::from_socket)
-        }
-
-        /// Set the resend interval.
-        ///
-        /// When set, [`request`](Self::request) retransmits the request after
-        /// `d` with no reply and repeats until a valid reply arrives or the
-        /// transport returns an error.  Matches NNG's `NNG_OPT_REQ_RESENDTIME`.
-        ///
-        /// Resend is disabled by default; `request()` waits indefinitely.
-        pub fn set_resend_time(&mut self, d: Duration) {
-            self.resend_time = Some(d);
-        }
-
-        /// Send `msg` and receive the reply.
-        ///
-        /// The request ID is stamped once for this call and reused verbatim on
-        /// every retransmit, so the server cannot distinguish an original from
-        /// a resend.  Stale replies — from a previous call's resend that arrived
-        /// after the call returned — are detected by ID mismatch and silently
-        /// discarded; `request` then waits for the correct reply.
-        ///
-        /// Returns an error only when the transport fails; a timeout (when
-        /// `set_resend_time` is configured) triggers a retransmit, not an error.
-        pub async fn request(&mut self, msg: Message) -> Result<Message, NngError> {
-            let mut outgoing = msg;
-            let sent_id = self.state.prepare_outgoing(&mut outgoing);
-
-            'send: loop {
-                self.inner.send_raw(&outgoing).await?;
-
-                loop {
-                    let raw = match self.resend_time {
-                        None => self.inner.recv_raw().await?,
-                        Some(t) => match tokio::time::timeout(t, self.inner.recv_raw()).await {
-                            Ok(r) => r?,
-                            Err(_elapsed) => continue 'send,
-                        },
-                    };
-
-                    let mut reply = raw;
-                    match self.state.process_incoming(&mut reply, sent_id) {
-                        Ok(()) => return Ok(reply),
-                        Err(ReqRepError::IdMismatch { .. }) => {} // stale reply, keep waiting
-                        Err(e) => return Err(NngError::ProtocolViolation(e.to_string())),
-                    }
-                }
-            }
-        }
-    }
-
-    /// Reply socket: listens for connections from requesters.
-    pub struct Rep0 {
-        inner: Socket<Rep0State>,
-        state: Rep0State,
-    }
-
-    /// Consumed by `reply()` to enforce that each receive has exactly one reply.
-    pub struct Responder<'a> {
-        socket: &'a mut Socket<Rep0State>,
-        routing: RoutingInfo,
-    }
-
-    impl<'a> Responder<'a> {
-        pub async fn reply(self, msg: Message) -> Result<(), NngError> {
-            let state = Rep0State::new();
-            let mut outgoing = msg;
-            state.prepare_reply(&mut outgoing, &self.routing);
-            self.socket.send_raw(&outgoing).await
-        }
-    }
-
-    impl Rep0 {
-        pub async fn listen(addr: &str) -> Result<Self, NngError> {
-            Socket::listen(addr, ProtocolId::REP0).await.map(|s| Self {
-                inner: s,
-                state: Rep0State::new(),
-            })
-        }
-
-        #[cfg(feature = "wss")]
-        pub async fn listen_tls(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_tls(addr, ProtocolId::REP0, cert_pem, key_pem)
-                .await
-                .map(|s| Self {
-                    inner: s,
-                    state: Rep0State::new(),
-                })
-        }
-
-        #[cfg(feature = "tls-tcp")]
-        pub async fn listen_tls_tcp(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_tls_tcp(addr, ProtocolId::REP0, cert_pem, key_pem)
-                .await
-                .map(|s| Self {
-                    inner: s,
-                    state: Rep0State::new(),
-                })
-        }
-
-        /// Bind a QUIC endpoint and wait for the first requester connection.
-        ///
-        /// `addr` must be a `quic://host:port` URL. `cert_pem` and `key_pem`
-        /// are paths to the server's PEM certificate and private key.
-        /// Requires the `quic` feature.
-        #[cfg(feature = "quic")]
-        pub async fn listen_quic(
-            addr: &str,
-            cert_pem: &std::path::Path,
-            key_pem: &std::path::Path,
-        ) -> Result<Self, NngError> {
-            Socket::listen_quic(addr, ProtocolId::REP0, cert_pem, key_pem)
-                .await
-                .map(|s| Self {
-                    inner: s,
-                    state: Rep0State::new(),
-                })
-        }
-
-        /// Bind a `kcp://` listener with a caller-supplied [`kcp_tokio::KcpConfig`].
-        /// Requires the `kcp` feature.  Both peers must use the same config.
-        #[cfg(feature = "kcp")]
-        pub async fn listen_kcp_with(
-            addr: &str,
-            config: kcp_tokio::KcpConfig,
-        ) -> Result<Self, NngError> {
-            Socket::listen_kcp_with(addr, ProtocolId::REP0, config)
-                .await
-                .map(|s| Self {
-                    inner: s,
-                    state: Rep0State::new(),
-                })
-        }
-
-        /// Receive the next request.  Returns the application message plus a
-        /// `Responder` that must be used to send the reply.
-        pub async fn receive(&mut self) -> Result<(Message, Responder<'_>), NngError> {
-            let mut msg = self.inner.recv_raw().await?;
-            let routing = self
-                .state
-                .process_incoming(&mut msg)
-                .map_err(|e| NngError::ProtocolViolation(e.to_string()))?;
-            Ok((
-                msg,
-                Responder {
-                    socket: &mut self.inner,
-                    routing,
-                },
-            ))
-        }
-    }
-}
-
-/// [`tower_service::Service`] adapter for [`reqrep0::Req0`].
-///
-/// Requires the `tower` Cargo feature.
+pub mod bus0;
+pub mod pair0;
+pub mod pipeline0;
+pub mod reqrep0;
 #[cfg(feature = "tower")]
-pub mod tower_svc {
-    use std::{
-        future::Future,
-        pin::Pin,
-        sync::Arc,
-        task::{Context, Poll},
-    };
-
-    use tokio::sync::Mutex;
-
-    use crate::{Message, error::NngError};
-
-    use super::reqrep0::Req0;
-
-    /// A cloneable [`tower_service::Service`] that sends requests through a
-    /// shared [`Req0`] socket.
-    ///
-    /// All clones share the same underlying socket via `Arc<Mutex<Req0>>`,
-    /// serializing requests (REQ0 allows only one in-flight request at a time).
-    /// Any resend time configured on the socket is preserved.
-    #[derive(Clone)]
-    pub struct Req0Service {
-        inner: Arc<Mutex<Req0>>,
-    }
-
-    impl Req0Service {
-        pub fn new(req0: Req0) -> Self {
-            Self {
-                inner: Arc::new(Mutex::new(req0)),
-            }
-        }
-    }
-
-    impl tower_service::Service<Message> for Req0Service {
-        type Response = Message;
-        type Error = NngError;
-        type Future = Pin<Box<dyn Future<Output = Result<Message, NngError>> + Send>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, req: Message) -> Self::Future {
-            let inner = Arc::clone(&self.inner);
-            Box::pin(async move { inner.lock().await.request(req).await })
-        }
-    }
-}
+pub mod tower_svc;

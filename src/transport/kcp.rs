@@ -47,12 +47,8 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use embedded_io_async::{ErrorType, Read, Write};
 use kcp_tokio::{KcpConfig, KcpListener, KcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex as TokioMutex;
 
 /// Parse a `host:port` string (kcp:// scheme already stripped, plus any
 /// trailing `/path` component dropped) into a [`SocketAddr`] via DNS lookup.
@@ -115,50 +111,22 @@ pub(crate) async fn connect_kcp_stream_with(
         .map_err(|e| io::Error::other(format!("kcp connect failed: {e}")))
 }
 
-/// Wraps a [`kcp_tokio::KcpStream`] as an `embedded-io-async` stream.
-///
-/// The second field is a listener keepalive — see the module-level docs.
-/// Dialer streams set it to `None`; accepted streams set it to a clone of
-/// the listener's [`Arc`].
-pub(crate) struct TokioKcpStream(
-    pub KcpStream,
-    /// Held only for its `Drop`: keeps the listener (and its UDP-routing
-    /// background task) alive for the lifetime of an accepted stream.
-    /// `None` for dialer streams, which own their own UDP socket.
-    #[allow(dead_code)]
-    pub Option<Arc<TokioMutex<KcpListener>>>,
-);
-
-impl ErrorType for TokioKcpStream {
-    type Error = io::Error;
-}
-
-impl Read for TokioKcpStream {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        AsyncReadExt::read(&mut self.0, buf).await
-    }
-}
-
-impl Write for TokioKcpStream {
-    /// Write and flush.
+adapt_async_io! {
+    /// Wraps a [`kcp_tokio::KcpStream`] as an `embedded-io-async` stream.
     ///
-    /// kcp-tokio's `AsyncWrite::poll_write` buffers data into the next KCP
-    /// segment but does not push it out to the underlying UDP socket until
-    /// `poll_flush` is called.  `FramedTransport` does not call `flush`
-    /// after `write_all`, so without an internal flush the SP handshake
-    /// bytes (and subsequent message frames) sit indefinitely in KCP's
-    /// send queue, hanging both peers on the first `read_exact`.
-    ///
-    /// Other transports (TCP, IPC, VSOCK) need no explicit flush because
-    /// their `poll_flush` is a no-op — the kernel sends data immediately
-    /// once it lands in the socket buffer.  KCP is the odd one out.
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
-        let n = AsyncWriteExt::write(&mut self.0, buf).await?;
-        AsyncWriteExt::flush(&mut self.0).await?;
-        Ok(n)
-    }
-
-    async fn flush(&mut self) -> Result<(), io::Error> {
-        AsyncWriteExt::flush(&mut self.0).await
-    }
+    /// The second field is a listener keepalive — see the module-level docs.
+    /// Dialer streams set it to `None`; accepted streams set it to a clone
+    /// of the listener's [`std::sync::Arc`].  `flush_each_write` is needed
+    /// because `kcp_tokio` buffers writes into the next outgoing KCP segment
+    /// until `poll_flush`; without it the SP handshake hangs.  See the
+    /// module-level docs for the full story.
+    pub(crate) TokioKcpStream wraps KcpStream,
+    flush_each_write,
+    extra: (
+        /// Held only for its `Drop`: keeps the listener (and its UDP-routing
+        /// background task) alive for the lifetime of an accepted stream.
+        /// `None` for dialer streams, which own their own UDP socket.
+        #[allow(dead_code)]
+        pub Option<std::sync::Arc<tokio::sync::Mutex<KcpListener>>>,
+    )
 }

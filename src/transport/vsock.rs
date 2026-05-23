@@ -30,8 +30,6 @@
 
 use std::io;
 
-use embedded_io_async::{ErrorType, Read, Write};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 
 /// Parse a `CID:port` string (vsock:// scheme already stripped) into a
@@ -66,25 +64,7 @@ pub(crate) async fn connect_vsock_stream(addr: &str) -> io::Result<VsockStream> 
     VsockStream::connect(parse_vsock_addr(addr)?).await
 }
 
-/// Wraps a [`tokio_vsock::VsockStream`] as an `embedded-io-async` stream.
-pub(crate) struct TokioVsockStream(pub VsockStream);
-
-impl ErrorType for TokioVsockStream {
-    type Error = io::Error;
-}
-
-impl Read for TokioVsockStream {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        AsyncReadExt::read(&mut self.0, buf).await
-    }
-}
-
-impl Write for TokioVsockStream {
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
-        AsyncWriteExt::write(&mut self.0, buf).await
-    }
-
-    async fn flush(&mut self) -> Result<(), io::Error> {
-        AsyncWriteExt::flush(&mut self.0).await
-    }
-}
+adapt_async_io!(
+    /// Wraps a [`tokio_vsock::VsockStream`] as an `embedded-io-async` stream.
+    pub(crate) TokioVsockStream wraps VsockStream
+);

@@ -351,41 +351,22 @@ fn load_key(path: &std::path::Path) -> Result<rustls::pki_types::PrivateKeyDer<'
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors from the WebSocket transport layer.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum WsError {
     /// Underlying tungstenite / WebSocket protocol error.
-    Tungstenite(tokio_tungstenite::tungstenite::Error),
+    #[error("WebSocket error: {0}")]
+    Tungstenite(#[from] tokio_tungstenite::tungstenite::Error),
     /// Server responded with a different `Sec-WebSocket-Protocol` than requested.
+    #[error("WebSocket subprotocol mismatch: expected {expected:?}, got {got:?}")]
     SubprotocolMismatch { expected: String, got: String },
     /// Invalid HTTP header value (should not occur with well-formed protocol names).
+    #[error("invalid WebSocket header value: {0}")]
     InvalidHeader(String),
     /// The WebSocket connection was closed cleanly.
+    #[error("WebSocket connection closed")]
     Closed,
     /// TLS configuration or handshake error (requires the `wss` feature).
     #[cfg(feature = "wss")]
+    #[error("TLS error: {0}")]
     Tls(String),
-}
-
-impl From<tokio_tungstenite::tungstenite::Error> for WsError {
-    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
-        Self::Tungstenite(e)
-    }
-}
-
-impl core::fmt::Display for WsError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Tungstenite(e) => write!(f, "WebSocket error: {e}"),
-            Self::SubprotocolMismatch { expected, got } => {
-                write!(
-                    f,
-                    "WebSocket subprotocol mismatch: expected {expected:?}, got {got:?}"
-                )
-            }
-            Self::InvalidHeader(s) => write!(f, "invalid WebSocket header value: {s}"),
-            Self::Closed => write!(f, "WebSocket connection closed"),
-            #[cfg(feature = "wss")]
-            Self::Tls(s) => write!(f, "TLS error: {s}"),
-        }
-    }
 }

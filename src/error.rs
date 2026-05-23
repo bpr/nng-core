@@ -29,73 +29,47 @@ use crate::{codec::CodecError, transport::TransportError};
 ///     Err(e) => { /* other: {e} */ }
 /// }
 /// ```
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum NngError {
     /// An OS or network I/O error.
-    Io(io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
     /// The SP handshake was rejected — wrong magic bytes or incompatible peer protocol.
+    #[error("SP handshake failed: {0}")]
     HandshakeFailed(CodecError),
     /// The peer closed the connection cleanly.
+    #[error("connection closed by peer")]
     ConnectionClosed,
     /// A frame length exceeded [`crate::transport::MAX_FRAME_BYTES`]; the peer is misbehaving.
+    #[error("frame length {0} exceeds limit")]
     FrameTooLarge(usize),
     /// An IPC frame contained an unexpected type byte (NNG 1.5.x framing only).
+    #[error("unexpected IPC frame type: {0:#04x}")]
     BadFrameType(u8),
     /// No peers are connected; the operation cannot proceed.
+    #[error("no peers connected")]
     NoPeers,
     /// Reconnect failed after exhausting all configured attempts.
+    #[error("reconnect failed: all attempts exhausted")]
     ReconnectExhausted,
     /// The URL scheme is not recognized.
+    #[error("unsupported URL scheme: {0}")]
     UnsupportedScheme(String),
     /// The URL scheme requires a Cargo feature that was not enabled at compile time.
+    #[error("URL scheme requires the `{0}` Cargo feature")]
     FeatureNotEnabled(&'static str),
     /// A protocol-level violation such as a WebSocket subprotocol mismatch or
     /// an unexpected request-ID in a REQ/REP exchange.
+    #[error("protocol violation: {0}")]
     ProtocolViolation(String),
-}
-
-impl std::fmt::Display for NngError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "I/O error: {e}"),
-            Self::HandshakeFailed(e) => write!(f, "SP handshake failed: {e}"),
-            Self::ConnectionClosed => write!(f, "connection closed by peer"),
-            Self::FrameTooLarge(n) => {
-                write!(f, "frame length {n} exceeds limit")
-            }
-            Self::BadFrameType(b) => write!(f, "unexpected IPC frame type: {b:#04x}"),
-            Self::NoPeers => write!(f, "no peers connected"),
-            Self::ReconnectExhausted => write!(f, "reconnect failed: all attempts exhausted"),
-            Self::UnsupportedScheme(s) => write!(f, "unsupported URL scheme: {s}"),
-            Self::FeatureNotEnabled(feat) => {
-                write!(f, "URL scheme requires the `{feat}` Cargo feature")
-            }
-            Self::ProtocolViolation(msg) => write!(f, "protocol violation: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for NngError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for NngError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
 }
 
 impl From<TransportError> for NngError {
     fn from(e: TransportError) -> Self {
         match e {
             TransportError::Handshake(c) => Self::HandshakeFailed(c),
-            TransportError::Io => Self::Io(io::Error::other("transport I/O error")),
+            TransportError::Io(s) => Self::Io(io::Error::other(s)),
             TransportError::Closed => Self::ConnectionClosed,
             TransportError::BadFrameType(b) => Self::BadFrameType(b),
             TransportError::FrameTooLarge(n) => Self::FrameTooLarge(n),

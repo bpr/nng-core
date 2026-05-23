@@ -34,9 +34,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::vec;
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{format, string::String, vec, vec::Vec};
 
 use embedded_io_async::{Read, Write};
 
@@ -67,44 +65,36 @@ pub enum FrameFormat {
 pub const MAX_FRAME_BYTES: usize = 1 << 30; // 1 GiB
 
 /// Error type for transport-layer operations.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum TransportError {
     /// The remote sent an invalid or incompatible SP handshake.
-    Handshake(CodecError),
+    #[error("SP handshake error: {0}")]
+    Handshake(#[from] CodecError),
     /// An I/O error occurred on the underlying stream.
-    Io,
+    ///
+    /// The string is the `Debug`-formatted source error from the underlying
+    /// `embedded_io_async::Read` / `Write` implementation.  When the eventual
+    /// consumer is [`crate::error::NngError`] this is wrapped via
+    /// `io::Error::other(s)`, preserving the message text but not the kind.
+    /// `String` (rather than `std::io::Error`) keeps the variant available
+    /// in `no_std + alloc` builds.
+    #[error("I/O error: {0}")]
+    Io(String),
     /// The connection was closed before the operation completed.
+    #[error("connection closed")]
     Closed,
     /// The remote sent an IPC frame whose type byte was not `0x01`.
     ///
     /// Only returned when using [`FrameFormat::Ipc`]. The inner value is the
     /// unexpected byte that was received.
+    #[error("unexpected IPC frame type: {0:#04x}")]
     BadFrameType(u8),
     /// The remote declared a frame larger than [`MAX_FRAME_BYTES`].
     ///
     /// The inner value is the declared length. Either the remote is
     /// misbehaving or the message must be split at the application layer.
+    #[error("frame length {0} exceeds limit of {max}", max = MAX_FRAME_BYTES)]
     FrameTooLarge(usize),
-}
-
-impl core::fmt::Display for TransportError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Handshake(e) => write!(f, "SP handshake error: {e}"),
-            Self::Io => write!(f, "I/O error"),
-            Self::Closed => write!(f, "connection closed"),
-            Self::BadFrameType(t) => write!(f, "unexpected IPC frame type: {t:#04x}"),
-            Self::FrameTooLarge(n) => {
-                write!(f, "frame length {n} exceeds limit of {MAX_FRAME_BYTES}")
-            }
-        }
-    }
-}
-
-impl From<CodecError> for TransportError {
-    fn from(e: CodecError) -> Self {
-        Self::Handshake(e)
-    }
 }
 
 /// Per-field receive state for cancellation-safe `recv`.
@@ -303,7 +293,7 @@ where
                     .inner
                     .read(&mut self.rx.len_buf[filled..needed])
                     .await
-                    .map_err(|_e| TransportError::Io)?;
+                    .map_err(|e| TransportError::Io(format!("{e:?}")))?;
                 if n == 0 {
                     return Err(TransportError::Closed);
                 }
@@ -341,7 +331,7 @@ where
                 .inner
                 .read(&mut self.rx.body[filled..])
                 .await
-                .map_err(|_e| TransportError::Io)?;
+                .map_err(|e| TransportError::Io(format!("{e:?}")))?;
             if n == 0 {
                 return Err(TransportError::Closed);
             }
@@ -453,7 +443,7 @@ async fn write_all<T: Write>(w: &mut T, buf: &[u8]) -> Result<(), TransportError
         match w.write(&buf[written..]).await {
             Ok(0) => return Err(TransportError::Closed),
             Ok(n) => written += n,
-            Err(_e) => return Err(TransportError::Io),
+            Err(e) => return Err(TransportError::Io(format!("{e:?}"))),
         }
     }
     Ok(())
@@ -465,10 +455,98 @@ async fn read_exact<T: Read>(r: &mut T, buf: &mut [u8]) -> Result<(), TransportE
         match r.read(&mut buf[read..]).await {
             Ok(0) => return Err(TransportError::Closed),
             Ok(n) => read += n,
-            Err(_e) => return Err(TransportError::Io),
+            Err(e) => return Err(TransportError::Io(format!("{e:?}"))),
         }
     }
     Ok(())
+}
+
+// ── Transport-adapter boilerplate macro ───────────────────────────────────────
+//
+// Each per-transport file (`tcp.rs`, `ipc.rs`, `vsock.rs`, `kcp.rs`) wraps a
+// concrete tokio type (`TcpStream`, `UnixStream`, …) as an
+// `embedded_io_async::Read + Write` adapter.  The body is the same six-line
+// `impl ErrorType / Read / Write` delegation each time, so this macro emits
+// it.
+//
+// The simple form:
+//
+//     adapt_async_io!(pub TokioTcpStream wraps tokio::net::TcpStream);
+//
+// The KCP form needs a flush-after-every-write (kcp_tokio buffers writes
+// until poll_flush) and a drop-guard field that keeps the listener alive
+// for accepted server-side streams — see `src/transport/kcp.rs`:
+//
+//     adapt_async_io! {
+//         pub(crate) TokioKcpStream wraps kcp_tokio::KcpStream,
+//         flush_each_write,
+//         extra: (
+//             #[allow(dead_code)]
+//             pub Option<std::sync::Arc<tokio::sync::Mutex<kcp_tokio::KcpListener>>>,
+//         )
+//     }
+#[cfg(feature = "std")]
+macro_rules! adapt_async_io {
+    (
+        $(#[$attr:meta])*
+        $vis:vis $wrapper:ident wraps $inner:ty
+    ) => {
+        $(#[$attr])*
+        $vis struct $wrapper(pub $inner);
+
+        impl ::embedded_io_async::ErrorType for $wrapper {
+            type Error = ::std::io::Error;
+        }
+
+        impl ::embedded_io_async::Read for $wrapper {
+            async fn read(&mut self, buf: &mut [u8]) -> ::std::io::Result<usize> {
+                ::tokio::io::AsyncReadExt::read(&mut self.0, buf).await
+            }
+        }
+
+        impl ::embedded_io_async::Write for $wrapper {
+            async fn write(&mut self, buf: &[u8]) -> ::std::io::Result<usize> {
+                ::tokio::io::AsyncWriteExt::write(&mut self.0, buf).await
+            }
+            async fn flush(&mut self) -> ::std::io::Result<()> {
+                ::tokio::io::AsyncWriteExt::flush(&mut self.0).await
+            }
+        }
+    };
+
+    (
+        $(#[$attr:meta])*
+        $vis:vis $wrapper:ident wraps $inner:ty,
+        flush_each_write
+        $(, extra: ( $($extra:tt)* ))?
+    ) => {
+        $(#[$attr])*
+        $vis struct $wrapper(
+            pub $inner,
+            $($($extra)*)?
+        );
+
+        impl ::embedded_io_async::ErrorType for $wrapper {
+            type Error = ::std::io::Error;
+        }
+
+        impl ::embedded_io_async::Read for $wrapper {
+            async fn read(&mut self, buf: &mut [u8]) -> ::std::io::Result<usize> {
+                ::tokio::io::AsyncReadExt::read(&mut self.0, buf).await
+            }
+        }
+
+        impl ::embedded_io_async::Write for $wrapper {
+            async fn write(&mut self, buf: &[u8]) -> ::std::io::Result<usize> {
+                let n = ::tokio::io::AsyncWriteExt::write(&mut self.0, buf).await?;
+                ::tokio::io::AsyncWriteExt::flush(&mut self.0).await?;
+                Ok(n)
+            }
+            async fn flush(&mut self) -> ::std::io::Result<()> {
+                ::tokio::io::AsyncWriteExt::flush(&mut self.0).await
+            }
+        }
+    };
 }
 
 // ── Transport submodules ──────────────────────────────────────────────────────
