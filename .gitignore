@@ -1,5 +1,6 @@
 /target/
 Cargo.lock
+commit_msg.txt
 fuzz/target/
 c_bench/push_client
 c_bench/pull_sink
