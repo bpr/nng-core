@@ -9,18 +9,96 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-22
+
 ### Added
 
-- **VSOCK transport** (`--features vsock`, Linux only) — AF_VSOCK via `tokio-vsock`
-  0.7.  Enables SP messaging between a VM guest and its host (or between two
-  VMs on the same hypervisor) without a network stack.  Uses the TCP frame
-  format (8-byte length header) and the standard SP handshake.  URL scheme:
-  `vsock://CID:port`.  The CID component accepts numeric values or the aliases
-  `any` (wildcard listener), `host` (CID 2), and `local` (CID 1, loopback).
-  All typed sockets support the scheme via the existing `listen` / `dial`
-  constructors — no dedicated `listen_vsock` / `dial_vsock` methods are needed.
-  Loopback testing (guest-to-guest on the same VM) requires the `vsock_loopback`
-  kernel module.
+- **VSOCK transport** (`--features vsock`, Linux only) — AF_VSOCK via
+  `tokio-vsock` 0.7.  Enables SP messaging between a VM guest and its host
+  (or between two VMs on the same hypervisor) without a network stack.
+  Uses the TCP frame format (8-byte length header) and the standard SP
+  handshake.  URL scheme: `vsock://CID:port`.  The CID component accepts
+  numeric values or the aliases `any` (wildcard listener), `host` (CID 2),
+  and `local` (CID 1, loopback).  All typed sockets support the scheme via
+  the existing `listen` / `dial` constructors — no dedicated `listen_vsock`
+  / `dial_vsock` methods are needed.  Loopback testing (guest-to-guest on
+  the same VM) requires the `vsock_loopback` kernel module.
+- **KCP transport** (`--features kcp`) — reliable, ordered ARQ over UDP
+  via `kcp-tokio` 0.5.  Each SP connection maps to one KCP session over a
+  managed UDP socket; the SP handshake and 8-byte TCP frame format run
+  over that session unchanged.  URL scheme: `kcp://host:port`.  KCP is not
+  part of the NNG/nanomsg ecosystem; this transport is for nng-core ↔
+  nng-core communication only (use `quic://` for encrypted reliable UDP).
+  Default config via `Socket::dial(addr)` / `Socket::listen(addr)`; for
+  caller-supplied tuning use `Push0::dial_kcp_with(addr, KcpConfig)` etc.
+  on Push0/Pull0/Pair0/Req0/Rep0.  Both peers must use the same config for
+  correct ARQ behavior.
+- **`Req0::builder()`** — builder API for initial configuration:
+  ```rust
+  let req = Req0::builder()
+      .resend_time(Duration::from_secs(2))
+      .dial("tcp://...")
+      .await?;
+  ```
+  Replaces the `dial → set_resend_time` two-step at construction time.
+  `Req0::set_resend_time` is **kept**, not deprecated, for runtime
+  adjustment of an already-dialed socket (e.g. the `req0_resend` bench
+  switches the resend interval between bench phases on a single shared
+  `Req0`).
+- **Stream-based accept API** on `Bus0`, `Pull0Fan`, and `Surveyor0` —
+  each gains a `bind(addr) -> (Self, AcceptStream)` constructor plus a
+  matching `add_peer` / `add_pusher` / `add_respondent` method:
+  ```rust
+  let (mut hub, mut accepts) = Bus0::bind(addr).await?;
+  let peer = accepts.accept().await?;
+  hub.add_peer(peer);
+  ```
+  Callers control per-peer admission policy (filter by peer addr,
+  rate-limit, batch).  The classic
+  `listen_and_accept(addr, n)` / `wait_for_respondents(n)` API is
+  unchanged for backwards compatibility.
+- **Typestate-pattern examples** — `examples/auth_then_data.rs` (a
+  two-state authenticated PAIR0 protocol) and `examples/tictactoe.rs`
+  (turn-based PAIR0 game with `Game<MyTurn>` / `Game<OpponentTurn>`
+  session types) demonstrate compile-time enforcement of protocol-state
+  invariants on top of nng-core sockets.
+
+### Changed
+
+- **Error types now use `thiserror`** — `NngError`, `TransportError`,
+  `CodecError`, `ReqRepError`, and `WsError` switched from hand-rolled
+  `Display` / `From` impls to the `thiserror` derive.  No user-visible
+  behavior change *except*: `TransportError::Io` now carries a
+  source-error string rather than being a unit variant, so the
+  underlying I/O error message is preserved across the
+  `TransportError` → `NngError` boundary (previously the message was
+  replaced with the literal string `"transport I/O error"`).  Code that
+  pattern-matches `TransportError::Io` without a binding must update to
+  `TransportError::Io(_)`.
+
+### Changed (internal, non-breaking)
+
+- **`socket.rs` split** into a `socket/` directory: one file per
+  per-protocol module (`pubsub0`, `survey0`, `bus0`, `pipeline0`,
+  `pair0`, `reqrep0`, `tower_svc`).  Module paths are unchanged
+  (`nng_core::socket::reqrep0::Req0`).
+- **`forward_socket_method!` declarative macro** collapses the
+  per-protocol wrapper methods (`Push0::dial_quic`,
+  `Pull0::listen_kcp_with`, etc.) that forward to `Socket::*` into
+  one-line invocations.
+- **`adapt_async_io!` declarative macro** replaces the per-transport
+  `embedded-io-async` adapter boilerplate (`tcp.rs`, `ipc.rs`,
+  `vsock.rs`, `kcp.rs`) with one canonical implementation.
+
+### Fixed
+
+- **`Pull0Fan` zombie tasks** — when a `Pull0Fan` was dropped, its
+  per-sender reader tasks could outlive it because they only exited on
+  channel-close, which the dropped `Pull0Fan`'s receiver triggered only
+  after every sender had emitted at least one item.  Fixed by replacing
+  the channel-close shutdown signal with a `tokio::sync::watch` channel
+  observed via `cancel.changed()`.  Dropping `Pull0Fan` now promptly
+  cancels every reader task, even ones whose peers are idle.
 
 ## [0.2.2]
 
@@ -190,7 +268,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **NNG 1.5.x IPC framing** — 9-byte header (`0x01` type byte + 8-byte BE u64
   length) correctly handled for both send and receive.
 
-[Unreleased]: https://github.com/bpr/nng-core/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/bpr/nng-core/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bpr/nng-core/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/bpr/nng-core/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/bpr/nng-core/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bpr/nng-core/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bpr/nng-core/releases/tag/v0.1.0
